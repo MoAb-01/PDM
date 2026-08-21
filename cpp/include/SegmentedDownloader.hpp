@@ -318,26 +318,14 @@ public:
             }
         }
 
-        // 4. Staggered Connection Ramp-Up (Instant Start)
-        // Stream #0 launches immediately so bytes stream in <10ms and UI shows instant progress
+        // 4. Parallel Concurrent Worker Launch:
+        // Launch all segment workers concurrently on their own dedicated threads in parallel
         {
             std::lock_guard<std::mutex> lock(m_threadsMutex);
             m_workerThreads.clear();
-            if (!m_segments.empty()) {
-                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, 0);
+            for (size_t i = 0; i < m_segments.size(); ++i) {
+                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, (int)i);
             }
-        }
-
-        // Remaining streams launch sequentially in background with 75ms stagger
-        if (m_segments.size() > 1) {
-            m_rampUpThread = std::thread([this]() {
-                for (size_t i = 1; i < m_segments.size() && m_running; ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(75));
-                    if (!m_running) break;
-                    std::lock_guard<std::mutex> lock(m_threadsMutex);
-                    m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, (int)i);
-                }
-            });
         }
 
         // 5. Spawn Monitor & Speed Calculator Thread
