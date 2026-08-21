@@ -28,6 +28,7 @@ public:
 
     std::vector<DownloadItem> GetDownloads();
     DownloadItem GetItem(const std::wstring& id);
+    std::shared_ptr<class SegmentedDownloader> GetActiveDownloader(const std::wstring& id);
     void UpdateItem(const DownloadItem& item);
     void DeleteItem(const std::wstring& id);
 

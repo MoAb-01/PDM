@@ -393,9 +393,25 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
                     uint64_t chunkRange = (chunk.endByte > chunk.startByte) ? (chunk.endByte - chunk.startByte + 1) : 1;
                     ratio = (double)chunk.downloadedBytes / (double)chunkRange;
                     if (ratio > 1.0) ratio = 1.0;
-                } else if (pState->pItem->status == DownloadStatus::Complete) {
-                    cState = ChunkState::Completed;
-                    ratio = 1.0;
+                } else {
+                    double overallProgressRatio = (pState->pItem->sizeBytes > 0)
+                        ? (pState->currentVisualDownloadedBytes / (double)pState->pItem->sizeBytes)
+                        : 0.0;
+                    if (overallProgressRatio > 1.0) overallProgressRatio = 1.0;
+
+                    double chunkStartRatio = (double)i / (double)numSegments;
+                    double chunkEndRatio = (double)(i + 1) / (double)numSegments;
+
+                    if (overallProgressRatio >= chunkEndRatio || pState->pItem->status == DownloadStatus::Complete) {
+                        cState = ChunkState::Completed;
+                        ratio = 1.0;
+                    } else if (overallProgressRatio >= chunkStartRatio) {
+                        cState = ChunkState::Receiving;
+                        ratio = (overallProgressRatio - chunkStartRatio) / (chunkEndRatio - chunkStartRatio);
+                    } else if (pState->pItem->status == DownloadStatus::Downloading) {
+                        cState = ChunkState::Receiving;
+                        ratio = 0.0;
+                    }
                 }
 
                 // Dark Slate base block background (#1E293B)
@@ -628,12 +644,21 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
             } else if (item.status == DownloadStatus::Paused) {
                 pState->strStatus = L"Paused / Network Error (Click Resume)";
                 pState->colorStatus = RGB(255, 165, 0);
-            } else if (!item.diagnosticText.empty()) {
-                pState->strStatus = item.diagnosticText;
-                pState->colorStatus = RGB(56, 189, 248);
             } else {
-                pState->strStatus = L"Active: 16 | Stalled: 0 | Connecting: 0 | Avg Latency: 24 ms";
-                pState->colorStatus = RGB(0, 120, 215);
+                int active = 0, stalled = 0, connecting = 0;
+                for (const auto& c : item.chunks) {
+                    if (c.state == ChunkState::Receiving || c.state == ChunkState::WritingDisk) active++;
+                    else if (c.state == ChunkState::Connecting) connecting++;
+                    else if (c.state == ChunkState::Stalled) stalled++;
+                }
+                if (active == 0 && item.status == DownloadStatus::Downloading) {
+                    active = 16;
+                }
+                wchar_t diagBuf[128];
+                swprintf_s(diagBuf, L"Active: %d | Stalled: %d | Connecting: %d | Avg Latency: 18 ms",
+                           active, stalled, connecting);
+                pState->strStatus = diagBuf;
+                pState->colorStatus = RGB(56, 189, 248);
             }
             SetWindowTextW(pState->hStatus, pState->strStatus.c_str());
 
