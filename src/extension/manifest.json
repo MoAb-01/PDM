@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "IDM Pro Media Sniffer Companion (AB)",
-  "version": "6.42.1",
-  "description": "Companion media sniffer extension for Internet Download Manager AB. Sniffs HLS .m3u8, MPEG-DASH .mpd, video/audio chunks, and direct file streams.",
+  "name": "AB Download Manager Companion",
+  "version": "1.0.0",
+  "description": "Companion media sniffer & download interception extension for AB Download Manager. Sniffs HLS .m3u8, MPEG-DASH .mpd, video/audio chunks, and direct file streams.",
   "permissions": [
     "nativeMessaging",
     "downloads",
@@ -29,6 +29,6 @@
   ],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "IDM Media Sniffer"
+    "default_title": "AB Media Sniffer"
   }
 }

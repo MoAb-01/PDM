@@ -64,7 +64,7 @@ public:
         HWND hWnd = CreateWindowExW(
             0,
             L"IDM_Native_MainWindowClass",
-            L"Internet Download Manager 6.42 Pro (AB Edition - Native C++)",
+            L"AB Download Manager",
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT, CW_USEDEFAULT, 1024, 620,
             NULL, NULL, GetModuleHandle(NULL), this
@@ -199,7 +199,7 @@ private:
         AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hMenuView, L"&View");
 
         HMENU hMenuHelp = CreatePopupMenu();
-        AppendMenuW(hMenuHelp, MF_STRING, 1030, L"About Internet Download Manager AB...");
+        AppendMenuW(hMenuHelp, MF_STRING, 1030, L"About AB Download Manager...");
         AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hMenuHelp, L"&Help");
 
         HMENU hMenuReg = CreatePopupMenu();
@@ -377,7 +377,7 @@ private:
         );
         int parts[] = { 380, 750, -1 };
         SendMessageW(m_hStatusBar, SB_SETPARTS, 3, (LPARAM)parts);
-        SendMessageW(m_hStatusBar, SB_SETTEXTW, 0, (LPARAM)L"IDM Native Engine: Ready (16-thread Acceleration)");
+        SendMessageW(m_hStatusBar, SB_SETTEXTW, 0, (LPARAM)L"AB Engine: Ready (16-thread Acceleration)");
         SendMessageW(m_hStatusBar, SB_SETTEXTW, 1, (LPARAM)L"Browser Integration: Active (Chrome, Edge, Firefox)");
         SendMessageW(m_hStatusBar, SB_SETTEXTW, 2, (LPARAM)L"Speed Limiter: OFF");
     }
@@ -762,7 +762,7 @@ private:
             } else if (id == 1005) { // Exit
                 PostQuitMessage(0);
             } else if (id == 1030) { // About
-                MessageBoxW(m_hWnd, L"Internet Download Manager 6.42 Pro (AB Edition - Native C++)\nEngine: 16-thread Range Acceleration & Media Sniffer\nAll rights reserved.", L"About IDM AB", MB_OK | MB_ICONINFORMATION);
+                MessageBoxW(m_hWnd, L"AB Download Manager\nEngine: 16-thread Range Acceleration & Media Sniffer\nAll rights reserved.", L"About AB Download Manager", MB_OK | MB_ICONINFORMATION);
             }
             return 0;
         }

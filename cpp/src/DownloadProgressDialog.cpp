@@ -702,7 +702,7 @@ static DWORD WINAPI StandaloneProgressThread(LPVOID lpParam) {
     HWND hDlg = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_APPWINDOW,
         L"IDM_DownloadProgressDialogClass",
-        L"Download Progress - Internet Download Manager AB",
+        L"Download Progress - AB Download Manager",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
         x, y, dlgW, dlgH,
         NULL, NULL, GetModuleHandle(NULL), pState

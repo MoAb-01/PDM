@@ -89,7 +89,7 @@ public:
     }
 
     bool probeUrl(const std::wstring& url, uint64_t& outSize, bool& outSupportsRange, std::wstring& outFileName) {
-        HINTERNET hInternet = InternetOpenW(L"Internet Download Manager 6.42 Pro (AB Engine)", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+        HINTERNET hInternet = InternetOpenW(L"AB Download Manager 1.0 (Native C++ Engine)", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
         if (!hInternet) return false;
 
         HINTERNET hConnect = InternetOpenUrlW(hInternet, url.c_str(), L"Range: bytes=0-0\r\n", -1, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
