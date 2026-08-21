@@ -13,6 +13,16 @@ enum class DownloadStatus {
     Error
 };
 
+enum class ChunkState {
+    Idle,
+    Connecting,
+    Receiving,
+    WritingDisk,
+    Stalled,
+    Completed,
+    Error
+};
+
 struct DownloadChunk {
     int id = 0;
     uint64_t startByte = 0;
@@ -20,6 +30,8 @@ struct DownloadChunk {
     uint64_t downloadedBytes = 0;
     bool active = false;
     bool completed = false;
+    ChunkState state = ChunkState::Idle;
+    uint32_t latencyMs = 0;
 };
 
 struct DownloadItem {
@@ -43,6 +55,7 @@ struct DownloadItem {
     bool resumeSupported = true;
 
     std::vector<DownloadChunk> chunks;
+    std::wstring diagnosticText = L"Active: 0 | Stalled: 0 | Connecting: 0 | Avg Latency: 0 ms";
 };
 
 struct IDMSettings {

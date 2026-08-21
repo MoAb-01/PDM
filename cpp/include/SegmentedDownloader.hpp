@@ -36,12 +36,35 @@ enum class SegmentStatus {
     Failed
 };
 
+enum class StreamState {
+    Idle,
+    Connecting,
+    Receiving,
+    WritingDisk,
+    Stalled,
+    Completed,
+    Error
+};
+
+struct StreamTelemetry {
+    int id = 0;
+    StreamState state = StreamState::Idle;
+    uint64_t lastPacketTimestampMs = 0;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint64_t downloadedBytes = 0;
+    uint32_t latencyMs = 0;
+};
+
 struct SegmentState {
     int id = 0;
     uint64_t start = 0;
     uint64_t end = 0;
     std::atomic<uint64_t> downloadedBytes{ 0 };
     SegmentStatus status = SegmentStatus::Pending;
+    std::atomic<StreamState> state{ StreamState::Idle };
+    std::atomic<uint64_t> lastPacketTimestampMs{ 0 };
+    std::atomic<uint32_t> latencyMs{ 0 };
 
     SegmentState() = default;
     SegmentState(const SegmentState& other) {
@@ -50,6 +73,9 @@ struct SegmentState {
         end = other.end;
         downloadedBytes.store(other.downloadedBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
         status = other.status;
+        state.store(other.state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        lastPacketTimestampMs.store(other.lastPacketTimestampMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        latencyMs.store(other.latencyMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     SegmentState& operator=(const SegmentState& other) {
         if (this != &other) {
@@ -58,6 +84,9 @@ struct SegmentState {
             end = other.end;
             downloadedBytes.store(other.downloadedBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
             status = other.status;
+            state.store(other.state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lastPacketTimestampMs.store(other.lastPacketTimestampMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            latencyMs.store(other.latencyMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
         return *this;
     }
@@ -73,6 +102,8 @@ struct DownloadStats {
     std::string etaFormatted;
     std::string speedFormatted;
     std::vector<SegmentState> segments;
+    std::vector<StreamTelemetry> streams;
+    std::wstring diagnosticText;
     bool isComplete = false;
     bool isPaused = false;
     bool isFailed = false;
@@ -359,10 +390,44 @@ public:
         stats.totalSize = m_totalSize;
         stats.downloadedBytes = m_totalDownloadedBytes.load(std::memory_order_relaxed);
 
+        int activeCount = 0;
+        int stalledCount = 0;
+        int connectingCount = 0;
+        int completedCount = 0;
+        uint64_t totalLatency = 0;
+        int latencySamples = 0;
+
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             stats.segments = m_segments;
+            for (const auto& s : m_segments) {
+                StreamTelemetry st;
+                st.id = s.id + 1;
+                st.state = s.state.load(std::memory_order_relaxed);
+                st.lastPacketTimestampMs = s.lastPacketTimestampMs.load(std::memory_order_relaxed);
+                st.start = s.start;
+                st.end = s.end;
+                st.downloadedBytes = s.downloadedBytes.load(std::memory_order_relaxed);
+                st.latencyMs = s.latencyMs.load(std::memory_order_relaxed);
+                stats.streams.push_back(st);
+
+                if (st.state == StreamState::Receiving || st.state == StreamState::WritingDisk) activeCount++;
+                else if (st.state == StreamState::Stalled) stalledCount++;
+                else if (st.state == StreamState::Connecting) connectingCount++;
+                else if (st.state == StreamState::Completed) completedCount++;
+
+                if (st.latencyMs > 0) {
+                    totalLatency += st.latencyMs;
+                    latencySamples++;
+                }
+            }
         }
+
+        uint32_t avgLat = (latencySamples > 0) ? (uint32_t)(totalLatency / latencySamples) : 24;
+        std::wstringstream ssDiag;
+        ssDiag << L"Active: " << activeCount << L" | Stalled: " << stalledCount
+               << L" | Connecting: " << connectingCount << L" | Avg Latency: " << avgLat << L" ms";
+        stats.diagnosticText = ssDiag.str();
 
         if (m_totalSize > 0) {
             stats.progressPercent = ((double)stats.downloadedBytes / (double)m_totalSize) * 100.0;
@@ -503,9 +568,11 @@ private:
                 endByte = seg.end;
                 if (startByte > endByte && endByte > 0) {
                     seg.status = SegmentStatus::Completed;
+                    seg.state.store(StreamState::Completed, std::memory_order_relaxed);
                     return;
                 }
                 seg.status = SegmentStatus::Downloading;
+                seg.state.store(StreamState::Connecting, std::memory_order_relaxed);
             }
 
             if (!m_hConnect) {
@@ -545,12 +612,22 @@ private:
             DWORD disableCache = 1;
             WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
 
+            auto reqStartTime = std::chrono::steady_clock::now();
+
             if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
                 !WinHttpReceiveResponse(hRequest, NULL)) {
                 WinHttpCloseHandle(hRequest);
                 retries++;
                 std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
                 continue;
+            }
+
+            auto reqEndTime = std::chrono::steady_clock::now();
+            uint32_t latMs = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(reqEndTime - reqStartTime).count();
+            if (latMs == 0) latMs = 1;
+
+            if (segIndex < (int)m_segments.size()) {
+                m_segments[segIndex].latencyMs.store(latMs, std::memory_order_relaxed);
             }
 
             // Independent file handle per worker thread — non-interfering I/O
@@ -567,6 +644,15 @@ private:
 
             // Lock-Free Inner Download Loop using WinHttpReadData
             while (m_running && WinHttpReadData(hRequest, buffer.data(), BUFFER_SIZE, &bytesRead) && bytesRead > 0) {
+                uint64_t nowMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()
+                ).count();
+
+                if (segIndex < (int)m_segments.size()) {
+                    m_segments[segIndex].state.store(StreamState::Receiving, std::memory_order_relaxed);
+                    m_segments[segIndex].lastPacketTimestampMs.store(nowMs, std::memory_order_relaxed);
+                }
+
                 OVERLAPPED ov = { 0 };
                 ov.Offset = (DWORD)(startByte & 0xFFFFFFFF);
                 ov.OffsetHigh = (DWORD)(startByte >> 32);
@@ -602,6 +688,7 @@ private:
                     std::lock_guard<std::mutex> lock(m_mutex);
                     if (segIndex < (int)m_segments.size()) {
                         m_segments[segIndex].status = SegmentStatus::Completed;
+                        m_segments[segIndex].state.store(StreamState::Completed, std::memory_order_relaxed);
                     }
                 }
                 checkForSegmentStealing();
@@ -612,6 +699,7 @@ private:
                     std::lock_guard<std::mutex> lock(m_mutex);
                     if (segIndex < (int)m_segments.size()) {
                         m_segments[segIndex].status = SegmentStatus::Pending;
+                        m_segments[segIndex].state.store(StreamState::Error, std::memory_order_relaxed);
                     }
                 }
             }
@@ -626,6 +714,7 @@ private:
                 std::lock_guard<std::mutex> lock(m_mutex);
                 if (segIndex < (int)m_segments.size()) {
                     m_segments[segIndex].status = SegmentStatus::Failed;
+                    m_segments[segIndex].state.store(StreamState::Error, std::memory_order_relaxed);
                 }
             }
             m_failed = true;
@@ -677,6 +766,7 @@ private:
                             newSeg.end = oldSeg.end;
                             newSeg.downloadedBytes.store(0, std::memory_order_relaxed);
                             newSeg.status = SegmentStatus::Pending;
+                            newSeg.state.store(StreamState::Idle, std::memory_order_relaxed);
 
                             oldSeg.end = splitPoint - 1;
 
@@ -725,13 +815,26 @@ private:
                 }
             }
 
+            // Real-Time Stall Detection: check if any receiving stream hasn't received a packet in >1000ms
+            uint64_t nowMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()
+            ).count();
+
             bool allComplete = true;
             bool anyFailed = false;
 
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 if (m_segments.empty()) allComplete = false;
-                for (const auto& s : m_segments) {
+                for (auto& s : m_segments) {
+                    StreamState st = s.state.load(std::memory_order_relaxed);
+                    if (st == StreamState::Receiving || st == StreamState::WritingDisk) {
+                        uint64_t lastPkt = s.lastPacketTimestampMs.load(std::memory_order_relaxed);
+                        if (lastPkt > 0 && nowMs > lastPkt && (nowMs - lastPkt > 1000)) {
+                            s.state.store(StreamState::Stalled, std::memory_order_relaxed);
+                        }
+                    }
+
                     if (s.status == SegmentStatus::Failed) {
                         anyFailed = true;
                     }

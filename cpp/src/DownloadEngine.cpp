@@ -446,8 +446,9 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                     d.downloadedBytes = stats.downloadedBytes;
                     d.sizeBytes = stats.totalSize;
                     d.speedBytesPerSec = stats.smoothedSpeedBps;
+                    d.diagnosticText = stats.diagnosticText;
 
-                    // Sync segment states to chunk list for visualizer
+                    // Sync segment states & live stream telemetry to chunk list for visualizer
                     if (d.chunks.size() != stats.segments.size()) {
                         d.chunks.clear();
                         for (const auto& s : stats.segments) {
@@ -458,6 +459,8 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                             c.downloadedBytes = s.downloadedBytes.load(std::memory_order_relaxed);
                             c.active = (s.status == SegmentStatus::Downloading);
                             c.completed = (s.status == SegmentStatus::Completed);
+                            c.state = (ChunkState)s.state.load(std::memory_order_relaxed);
+                            c.latencyMs = s.latencyMs.load(std::memory_order_relaxed);
                             d.chunks.push_back(c);
                         }
                     } else {
@@ -465,6 +468,8 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                             d.chunks[i].downloadedBytes = stats.segments[i].downloadedBytes.load(std::memory_order_relaxed);
                             d.chunks[i].active = (stats.segments[i].status == SegmentStatus::Downloading);
                             d.chunks[i].completed = (stats.segments[i].status == SegmentStatus::Completed);
+                            d.chunks[i].state = (ChunkState)stats.segments[i].state.load(std::memory_order_relaxed);
+                            d.chunks[i].latencyMs = stats.segments[i].latencyMs.load(std::memory_order_relaxed);
                         }
                     }
 
