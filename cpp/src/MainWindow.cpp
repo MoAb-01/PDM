@@ -53,12 +53,19 @@ public:
         icex.dwICC = ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_TAB_CLASSES;
         InitCommonControlsEx(&icex);
 
+        HICON hIconBig = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+        if (!hIconBig) hIconBig = (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico", IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+        HICON hIconSmall = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+        if (!hIconSmall) hIconSmall = (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+
         WNDCLASSEXW wcex = { sizeof(WNDCLASSEXW) };
         wcex.lpfnWndProc = MainWindow::WndProc;
         wcex.hInstance = GetModuleHandle(NULL);
         wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
         wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         wcex.lpszClassName = L"IDM_Native_MainWindowClass";
+        wcex.hIcon = hIconBig;
+        wcex.hIconSm = hIconSmall;
         RegisterClassExW(&wcex);
 
         HWND hWnd = CreateWindowExW(
@@ -69,6 +76,11 @@ public:
             CW_USEDEFAULT, CW_USEDEFAULT, 1024, 620,
             NULL, NULL, GetModuleHandle(NULL), this
         );
+
+        if (hWnd && hIconBig) {
+            SendMessageW(hWnd, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
+            SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSmall);
+        }
 
         return hWnd;
     }

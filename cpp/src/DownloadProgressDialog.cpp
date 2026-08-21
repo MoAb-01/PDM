@@ -714,6 +714,13 @@ static DWORD WINAPI StandaloneProgressThread(LPVOID lpParam) {
         return 0;
     }
 
+    HICON hIconBig = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+    if (!hIconBig) hIconBig = (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico", IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+    if (hIconBig) {
+        SendMessageW(hDlg, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
+        SendMessageW(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)hIconBig);
+    }
+
     ShowWindow(hDlg, SW_SHOWNORMAL);
     UpdateWindow(hDlg);
     SetForegroundWindow(hDlg);

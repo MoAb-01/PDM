@@ -15,6 +15,8 @@ cmake --build . --config Release
 
 echo.
 if exist Release\DownloadManagerAB.exe (
+    copy /y "..\app_icon.ico" "Release\app_icon.ico" >nul 2>&1
+    copy /y "..\app_icon.png" "Release\app_icon.png" >nul 2>&1
     echo ===================================================
     echo SUCCESS! Native C++ binaries compiled:
     echo  - build\Release\DownloadManagerAB.exe
