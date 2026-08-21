@@ -6,7 +6,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <wininet.h>
+#include <winhttp.h>
 #include <string>
 #include <vector>
 #include <deque>
@@ -20,7 +20,7 @@
 #include <sstream>
 #include <iomanip>
 
-#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "winhttp.lib")
 
 #ifdef min
 #undef min
@@ -79,6 +79,37 @@ struct DownloadStats {
     std::string errorMessage;
 };
 
+struct ParsedHttpUrl {
+    std::wstring host;
+    std::wstring path;
+    INTERNET_PORT port = INTERNET_DEFAULT_HTTP_PORT;
+    bool isHttps = false;
+    bool valid = false;
+};
+
+static ParsedHttpUrl CrackHttpUrl(const std::wstring& url) {
+    ParsedHttpUrl res;
+    URL_COMPONENTS urlComp = { 0 };
+    urlComp.dwStructSize = sizeof(urlComp);
+    
+    wchar_t hostName[512] = { 0 };
+    wchar_t urlPath[2048] = { 0 };
+    
+    urlComp.lpszHostName = hostName;
+    urlComp.dwHostNameLength = 512;
+    urlComp.lpszUrlPath = urlPath;
+    urlComp.dwUrlPathLength = 2048;
+    
+    if (WinHttpCrackUrl(url.c_str(), (DWORD)url.length(), 0, &urlComp)) {
+        res.host = hostName;
+        res.path = urlPath;
+        res.port = urlComp.nPort;
+        res.isHttps = (urlComp.nScheme == INTERNET_SCHEME_HTTPS);
+        res.valid = true;
+    }
+    return res;
+}
+
 class SegmentedDownloader {
 public:
     using StatsCallback = std::function<void(const DownloadStats& stats)>;
@@ -89,48 +120,63 @@ public:
     }
 
     bool probeUrl(const std::wstring& url, uint64_t& outSize, bool& outSupportsRange, std::wstring& outFileName) {
-        if (!m_hInternet) {
-            DWORD maxConns = 64;
-            InternetSetOptionW(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
-            InternetSetOptionW(NULL, INTERNET_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
+        ParsedHttpUrl pUrl = CrackHttpUrl(url);
+        if (!pUrl.valid) return false;
 
-            m_hInternet = InternetOpenW(L"AB Download Manager 1.0 (Native C++ Engine)", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-            if (m_hInternet) {
-                DWORD timeoutMs = 5000;
-                InternetSetOptionW(m_hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-                InternetSetOptionW(m_hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-                InternetSetOptionW(m_hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-                DWORD retries = 2;
-                InternetSetOptionW(m_hInternet, INTERNET_OPTION_CONNECT_RETRIES, &retries, sizeof(retries));
-            }
-        }
-        if (!m_hInternet) return false;
-
-        HINTERNET hConnect = InternetOpenUrlW(
-            m_hInternet,
-            url.c_str(),
-            L"Range: bytes=0-0\r\n",
-            -1,
-            INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE,
+        HINTERNET hSession = WinHttpOpen(
+            L"AB Download Manager 1.0 (WinHTTP Engine)",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
             0
         );
+        if (!hSession) return false;
+
+        DWORD maxConns = 64;
+        WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
+        WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
+        WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 8000);
+
+        HINTERNET hConnect = WinHttpConnect(hSession, pUrl.host.c_str(), pUrl.port, 0);
         if (!hConnect) {
+            WinHttpCloseHandle(hSession);
             return false;
         }
 
-        // Check Status Code
+        DWORD flags = pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
+
+        std::wstring headers = L"Range: bytes=0-0\r\n";
+        WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)headers.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+
+        DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
+
+        DWORD disableCache = 1;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
+
+        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(hRequest, NULL)) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
+
         DWORD statusCode = 0;
         DWORD statusSize = sizeof(statusCode);
-        DWORD index = 0;
-        HttpQueryInfoW(hConnect, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &statusSize, &index);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
 
         outSupportsRange = (statusCode == 206);
 
-        // Check Content-Range or Content-Length
         wchar_t contentRange[256] = { 0 };
         DWORD crSize = sizeof(contentRange);
-        index = 0;
-        if (HttpQueryInfoW(hConnect, HTTP_QUERY_CONTENT_RANGE, contentRange, &crSize, &index)) {
+        if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX, contentRange, &crSize, WINHTTP_NO_HEADER_INDEX)) {
             std::wstring crStr = contentRange;
             size_t slash = crStr.find(L'/');
             if (slash != std::wstring::npos && slash + 1 < crStr.length()) {
@@ -144,13 +190,14 @@ public:
         if (outSize == 0) {
             DWORD cl = 0;
             DWORD clSize = sizeof(cl);
-            index = 0;
-            if (HttpQueryInfoW(hConnect, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &cl, &clSize, &index)) {
+            if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &cl, &clSize, WINHTTP_NO_HEADER_INDEX)) {
                 outSize = cl;
             }
         }
 
-        InternetCloseHandle(hConnect);
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
         return true;
     }
 
@@ -173,22 +220,13 @@ public:
         m_lastEtaUpdateTime = std::chrono::steady_clock::now();
         m_samples.clear();
 
-        // 1. Probe Server with shared session handle
+        m_pUrl = CrackHttpUrl(url);
+
+        // 1. Probe Server
         uint64_t totalSize = 0;
         bool supportsRange = false;
         std::wstring fn;
-        if (!probeUrl(url, totalSize, supportsRange, fn) || totalSize == 0) {
-            // Fallback probe without range
-            if (m_hInternet) {
-                HINTERNET hUrl = InternetOpenUrlW(m_hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE, 0);
-                if (hUrl) {
-                    DWORD cl = 0; DWORD clSize = sizeof(cl); DWORD idx = 0;
-                    HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &cl, &clSize, &idx);
-                    totalSize = cl;
-                    InternetCloseHandle(hUrl);
-                }
-            }
-        }
+        probeUrl(url, totalSize, supportsRange, fn);
 
         m_totalSize = totalSize;
         m_supportsRange = supportsRange;
@@ -197,9 +235,27 @@ public:
             m_numSegments = 1;
         }
 
+        // Initialize WinHTTP Session & Connection for Worker Multiplexing
+        if (m_pUrl.valid) {
+            m_hSession = WinHttpOpen(
+                L"AB Download Manager 1.0 (WinHTTP Engine)",
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0
+            );
+            if (m_hSession) {
+                DWORD maxConns = 64;
+                WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
+                WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
+                WinHttpSetTimeouts(m_hSession, 5000, 5000, 5000, 8000);
+
+                m_hConnect = WinHttpConnect(m_hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
+            }
+        }
+
         // 2. Pre-allocate disk file with high performance FileAllocationInfo
         if (!preallocateFile(m_outputPath, m_totalSize)) {
-            // Fallback create
             HANDLE hFile = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
         }
@@ -232,8 +288,12 @@ public:
         }
 
         // 4. Spawn Worker Threads
-        for (int i = 0; i < (int)m_segments.size(); ++i) {
-            m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, i);
+        {
+            std::lock_guard<std::mutex> lock(m_threadsMutex);
+            m_workerThreads.clear();
+            for (int i = 0; i < (int)m_segments.size(); ++i) {
+                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, i);
+            }
         }
 
         // 5. Spawn Monitor & Speed Calculator Thread
@@ -357,7 +417,9 @@ private:
     std::chrono::steady_clock::time_point m_speedDropStartTime = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point m_lastEtaUpdateTime = std::chrono::steady_clock::now();
 
-    HINTERNET m_hInternet = NULL;
+    ParsedHttpUrl m_pUrl;
+    HINTERNET m_hSession = NULL;
+    HINTERNET m_hConnect = NULL;
     std::mutex m_threadsMutex;
 
     void joinThreads() {
@@ -371,9 +433,13 @@ private:
             if (t.joinable()) t.join();
         }
         if (m_monitorThread.joinable()) m_monitorThread.join();
-        if (m_hInternet) {
-            InternetCloseHandle(m_hInternet);
-            m_hInternet = NULL;
+        if (m_hConnect) {
+            WinHttpCloseHandle(m_hConnect);
+            m_hConnect = NULL;
+        }
+        if (m_hSession) {
+            WinHttpCloseHandle(m_hSession);
+            m_hSession = NULL;
         }
     }
 
@@ -425,35 +491,55 @@ private:
                 seg.status = SegmentStatus::Downloading;
             }
 
-            std::wstring headers;
-            if (m_supportsRange && endByte > 0) {
-                headers = L"Range: bytes=" + std::to_wstring(startByte) + L"-" + std::to_wstring(endByte) + L"\r\n";
-            }
-
-            if (!m_hInternet) {
+            if (!m_hConnect) {
                 retries++;
                 std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
                 continue;
             }
 
-            HINTERNET hUrl = InternetOpenUrlW(
-                m_hInternet,
-                m_url.c_str(),
-                headers.empty() ? NULL : headers.c_str(),
-                -1,
-                INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE,
-                0
+            DWORD flags = m_pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
+            HINTERNET hRequest = WinHttpOpenRequest(
+                m_hConnect,
+                L"GET",
+                m_pUrl.path.c_str(),
+                NULL,
+                WINHTTP_NO_REFERER,
+                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                flags
             );
-            if (!hUrl) {
+
+            if (!hRequest) {
                 retries++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (1 << retries)));
+                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
+                continue;
+            }
+
+            std::wstring headers;
+            if (m_supportsRange && endByte > 0) {
+                headers = L"Range: bytes=" + std::to_wstring(startByte) + L"-" + std::to_wstring(endByte) + L"\r\n";
+            }
+            if (!headers.empty()) {
+                WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)headers.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+
+            DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+            WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
+
+            DWORD disableCache = 1;
+            WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
+
+            if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+                !WinHttpReceiveResponse(hRequest, NULL)) {
+                WinHttpCloseHandle(hRequest);
+                retries++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
                 continue;
             }
 
             // Independent file handle per worker thread — non-interfering I/O
             HANDLE hFile = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile == INVALID_HANDLE_VALUE) {
-                InternetCloseHandle(hUrl);
+                WinHttpCloseHandle(hRequest);
                 return;
             }
 
@@ -462,8 +548,8 @@ private:
             DWORD bytesRead = 0;
             bool failed = false;
 
-            // Lock-Free Inner Download Loop
-            while (m_running && InternetReadFile(hUrl, buffer.data(), BUFFER_SIZE, &bytesRead) && bytesRead > 0) {
+            // Lock-Free Inner Download Loop using WinHttpReadData
+            while (m_running && WinHttpReadData(hRequest, buffer.data(), BUFFER_SIZE, &bytesRead) && bytesRead > 0) {
                 OVERLAPPED ov = { 0 };
                 ov.Offset = (DWORD)(startByte & 0xFFFFFFFF);
                 ov.OffsetHigh = (DWORD)(startByte >> 32);
@@ -482,7 +568,7 @@ private:
             }
 
             CloseHandle(hFile);
-            InternetCloseHandle(hUrl);
+            WinHttpCloseHandle(hRequest);
 
             // Strict Segment Completion Check:
             bool isTrulyComplete = false;

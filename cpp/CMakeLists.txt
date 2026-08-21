@@ -23,6 +23,7 @@ add_executable(DownloadManagerAB WIN32
 target_link_libraries(DownloadManagerAB PRIVATE
     comctl32
     wininet
+    winhttp
     ws2_32
     dwmapi
     uxtheme
@@ -30,6 +31,8 @@ target_link_libraries(DownloadManagerAB PRIVATE
     user32
     gdi32
     gdiplus
+    d2d1
+    dwrite
     shell32
 )
 
