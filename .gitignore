@@ -1,0 +1,26 @@
+# Build and compiler outputs
+/cpp/build/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+*.ipch
+*.log
+
+# Node dependencies and build
+node_modules/
+dist/
+.vite/
+
+# Temporary and partial download files
+*.partial
+*.tmp
+
+# Environment and editor files
+.vscode/
+.idea/
+.gemini/
+Thumbs.db
+.DS_Store

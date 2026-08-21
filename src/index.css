@@ -1,0 +1,961 @@
+/* ==========================================================================
+   IDM Pro (Download Manager AB) - Modernized Classic Dark/Light Theme System
+   ========================================================================== */
+
+:root {
+  --bg-app: #1c1c1e;
+  --bg-window: #252528;
+  --bg-surface: #2d2d32;
+  --bg-surface-hover: #37373e;
+  --bg-input: #1a1a1c;
+  --bg-toolbar: #232326;
+  --bg-sidebar: #1f1f22;
+  --bg-table-header: #28282c;
+  --bg-table-row-alt: #222225;
+  --bg-table-selected: #1c3b5e;
+  --bg-table-selected-hover: #234b77;
+
+  --border-color: #38383e;
+  --border-subtle: #2d2d32;
+  --border-dialog: #4a4a52;
+
+  --text-primary: #f0f0f4;
+  --text-secondary: #a0a0ab;
+  --text-muted: #6e6e78;
+  --text-link: #4ea8de;
+  --text-highlight: #5eead4;
+
+  --accent-cyan: #06b6d4;
+  --accent-blue: #3b82f6;
+  --accent-green: #22c55e;
+  --accent-amber: #f59e0b;
+  --accent-red: #ef4444;
+  --accent-purple: #a855f7;
+
+  --chunk-bg: #1e293b;
+  --chunk-filled: #0284c7;
+  --chunk-active: #38bdf8;
+
+  --font-ui: "Segoe UI", -apple-system, BlinkMacSystemFont, "Inter", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", Consolas, "Courier New", monospace;
+  --font-dialog: "Segoe UI", Tahoma, sans-serif;
+
+  --shadow-window: 0 20px 40px -15px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  --shadow-dialog: 0 25px 50px -12px rgba(0, 0, 0, 0.85), 0 0 0 1px #4a4a52;
+  --shadow-dropdown: 0 10px 25px -5px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.1);
+}
+
+/* Base resets */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  line-height: 1.4;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+  -webkit-font-smoothing: antialiased;
+}
+
+input, textarea, select, button {
+  font-family: inherit;
+  font-size: inherit;
+  user-select: text;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: #18181a;
+}
+::-webkit-scrollbar-thumb {
+  background: #3e3e44;
+  border-radius: 4px;
+  border: 2px solid #18181a;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #55555e;
+}
+
+/* Main Application Window */
+.idm-app-window {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg-app);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-window);
+  overflow: hidden;
+}
+
+/* Title Bar */
+.idm-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  background: #141416;
+  border-bottom: 1px solid #28282c;
+  padding: 0 10px;
+}
+
+.idm-title-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #e2e2e8;
+}
+
+.idm-globe-icon {
+  width: 16px;
+  height: 16px;
+  background: radial-gradient(circle, #38bdf8, #0284c7, #164e63);
+  border-radius: 50%;
+  position: relative;
+  box-shadow: 0 0 6px rgba(56, 189, 248, 0.6);
+}
+
+.idm-globe-icon::after {
+  content: "↓";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: #fff;
+  font-size: 9px;
+  font-weight: bold;
+}
+
+.idm-title-controls {
+  display: flex;
+  align-items: center;
+}
+
+.idm-win-btn {
+  width: 38px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.idm-win-btn:hover {
+  background: #2a2a30;
+  color: #fff;
+}
+
+.idm-win-btn.close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+/* Top Menubar */
+.idm-menubar {
+  display: flex;
+  background: #1e1e22;
+  border-bottom: 1px solid #303036;
+  padding: 2px 6px;
+  gap: 2px;
+  font-size: 11.5px;
+}
+
+.idm-menu-item {
+  padding: 3px 8px;
+  color: #ccc;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.12s;
+  position: relative;
+}
+
+.idm-menu-item:hover, .idm-menu-item.active {
+  background: #33333b;
+  color: #fff;
+}
+
+.idm-dropdown-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background: #232328;
+  border: 1px solid #44444e;
+  border-radius: 4px;
+  box-shadow: var(--shadow-dropdown);
+  min-width: 180px;
+  padding: 4px 0;
+  z-index: 1000;
+}
+
+.idm-dropdown-entry {
+  padding: 6px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #ddd;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.idm-dropdown-entry:hover {
+  background: #0284c7;
+  color: #fff;
+}
+
+.idm-dropdown-divider {
+  height: 1px;
+  background: #383842;
+  margin: 4px 0;
+}
+
+/* Toolbar Buttons Bar */
+.idm-toolbar {
+  display: flex;
+  align-items: center;
+  background: #26262b;
+  border-bottom: 1px solid #36363e;
+  padding: 4px 8px;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.idm-tool-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 58px;
+  padding: 5px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #dedee6;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.idm-tool-btn:hover:not(:disabled) {
+  background: #35353d;
+  border-color: #484854;
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.idm-tool-btn:active:not(:disabled) {
+  background: #1f1f24;
+  transform: translateY(0);
+}
+
+.idm-tool-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.idm-tool-icon-wrapper {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  transition: transform 0.15s;
+}
+
+.idm-tool-btn:hover .idm-tool-icon-wrapper {
+  transform: scale(1.08);
+}
+
+.idm-toolbar-divider {
+  width: 1px;
+  height: 34px;
+  background: #3b3b44;
+  margin: 0 4px;
+}
+
+/* Special Toolbar Badges */
+.badge-pulse {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: bold;
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.pulse-dot {
+  width: 6px;
+  height: 6px;
+  background: #22c55e;
+  border-radius: 50%;
+  animation: pulse-glow 1.5s infinite;
+}
+
+@keyframes pulse-glow {
+  0% { transform: scale(0.9); opacity: 0.7; }
+  50% { transform: scale(1.3); opacity: 1; box-shadow: 0 0 8px #22c55e; }
+  100% { transform: scale(0.9); opacity: 0.7; }
+}
+
+/* Main Workspace Layout */
+.idm-workspace {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  background: #18181b;
+}
+
+/* Sidebar Treeview */
+.idm-sidebar {
+  width: 210px;
+  min-width: 170px;
+  background: #1e1e22;
+  border-right: 1px solid #303038;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.idm-sidebar-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #8e8e99;
+  border-bottom: 1px solid #282830;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.idm-tree-section {
+  padding: 4px 0;
+}
+
+.idm-tree-item {
+  display: flex;
+  align-items: center;
+  padding: 5px 12px;
+  gap: 8px;
+  font-size: 12px;
+  color: #c8c8d0;
+  cursor: pointer;
+  transition: all 0.12s;
+  position: relative;
+}
+
+.idm-tree-item.nested {
+  padding-left: 28px;
+}
+
+.idm-tree-item:hover {
+  background: #2b2b32;
+  color: #fff;
+}
+
+.idm-tree-item.active {
+  background: #1c3b5e;
+  color: #fff;
+  font-weight: 500;
+}
+
+.idm-tree-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: #888;
+  background: #2d2d34;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+
+.idm-tree-item.active .idm-tree-count {
+  background: #255282;
+  color: #e0f2fe;
+}
+
+/* Table Area */
+.idm-content-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: #151518;
+  overflow: hidden;
+}
+
+/* Search and Quick Filters Bar */
+.idm-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: #202025;
+  border-bottom: 1px solid #2d2d35;
+  gap: 12px;
+}
+
+.idm-search-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #151518;
+  border: 1px solid #383842;
+  border-radius: 4px;
+  padding: 3px 8px;
+  width: 240px;
+}
+
+.idm-search-input {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #eee;
+  font-size: 11.5px;
+  width: 100%;
+}
+
+.idm-quick-stats {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 11px;
+  color: #999;
+}
+
+.stat-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.stat-val {
+  color: #e2e8f0;
+  font-weight: 600;
+}
+
+/* Grid Table */
+.idm-table-container {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+}
+
+.idm-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  text-align: left;
+}
+
+.idm-table th {
+  position: sticky;
+  top: 0;
+  background: #25252b;
+  color: #b0b0bc;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-right: 1px solid #353540;
+  border-bottom: 1px solid #383844;
+  white-space: nowrap;
+  z-index: 10;
+}
+
+.idm-table th:hover {
+  background: #2e2e36;
+  color: #fff;
+}
+
+.idm-table td {
+  padding: 5px 10px;
+  border-right: 1px solid #222228;
+  border-bottom: 1px solid #222228;
+  color: #d1d1db;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.idm-table tr {
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.idm-table tr:nth-child(even) {
+  background: #18181c;
+}
+
+.idm-table tr:nth-child(odd) {
+  background: #141416;
+}
+
+.idm-table tr:hover {
+  background: #26262e;
+}
+
+.idm-table tr.selected {
+  background: var(--bg-table-selected) !important;
+  color: #ffffff;
+}
+
+.idm-table tr.selected td {
+  border-right-color: #2b517e;
+  border-bottom-color: #2b517e;
+  color: #ffffff;
+}
+
+/* Table File Cell with Icon */
+.idm-file-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-icon-badge {
+  font-size: 9px;
+  font-weight: 800;
+  padding: 1px 4px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.badge-pdf { background: #dc2626; color: #fff; }
+.badge-zip, .badge-rar, .badge-7z { background: #ea580c; color: #fff; }
+.badge-exe, .badge-msi { background: #2563eb; color: #fff; }
+.badge-mp4, .badge-mkv, .badge-m3u8 { background: #7c3aed; color: #fff; }
+.badge-mp3, .badge-wav { background: #059669; color: #fff; }
+.badge-default { background: #4b5563; color: #fff; }
+
+/* In-table mini progress bar */
+.table-prog-bar {
+  width: 100%;
+  height: 14px;
+  background: #222228;
+  border: 1px solid #33333d;
+  border-radius: 2px;
+  overflow: hidden;
+  position: relative;
+}
+
+.table-prog-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #0284c7, #38bdf8);
+  transition: width 0.2s ease;
+}
+
+.table-prog-fill.completed {
+  background: linear-gradient(90deg, #16a34a, #4ade80);
+}
+
+.table-prog-fill.paused {
+  background: linear-gradient(90deg, #d97706, #fbbf24);
+}
+
+.table-prog-fill.error {
+  background: linear-gradient(90deg, #b91c1c, #f87171);
+}
+
+.table-prog-text {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9.5px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+/* Status Bar */
+.idm-statusbar {
+  height: 24px;
+  background: #18181c;
+  border-top: 1px solid #2b2b32;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  font-size: 11px;
+  color: #8e8e98;
+}
+
+.idm-status-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.idm-status-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/* Speed Limiter Switch */
+.speed-limiter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+/* ==========================================================================
+   IDM Classic/Modern Dialog Windows (Properties & Configuration)
+   ========================================================================== */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* IDM Window Box */
+.idm-dialog {
+  background: #f0f0f0;
+  color: #000;
+  border: 1px solid #707070;
+  box-shadow: var(--shadow-dialog);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  font-size: 12px;
+}
+
+/* Dark mode version of IDM dialog (Sleek High Contrast) */
+.idm-dialog.dark-modal {
+  background: #252528;
+  color: #f1f1f5;
+  border: 1px solid #4a4a54;
+}
+
+.idm-dialog-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: #fff;
+  border-bottom: 1px solid #d0d0d0;
+  color: #111;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.idm-dialog.dark-modal .idm-dialog-titlebar {
+  background: #18181a;
+  border-bottom: 1px solid #36363e;
+  color: #f5f5f7;
+}
+
+.idm-dialog-title-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.idm-dialog-close {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: 14px;
+  color: #666;
+  border-radius: 2px;
+}
+
+.idm-dialog-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.idm-dialog-body {
+  padding: 16px 20px;
+  overflow-y: auto;
+  max-height: 80vh;
+}
+
+.idm-dialog-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 20px;
+  background: #e6e6e6;
+  border-top: 1px solid #d0d0d0;
+}
+
+.idm-dialog.dark-modal .idm-dialog-footer {
+  background: #1c1c1f;
+  border-top: 1px solid #36363e;
+}
+
+/* IDM Standard Form Buttons */
+.idm-btn {
+  min-width: 80px;
+  height: 26px;
+  padding: 0 14px;
+  background: #e1e1e1;
+  border: 1px solid #adadad;
+  border-radius: 2px;
+  color: #000;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.12s;
+}
+
+.idm-btn:hover:not(:disabled) {
+  background: #e5f1fb;
+  border-color: #0078d7;
+}
+
+.idm-btn:active:not(:disabled) {
+  background: #cce4f7;
+  border-color: #005499;
+}
+
+.idm-btn.primary {
+  border-color: #0078d7;
+  font-weight: 500;
+}
+
+/* Dark mode buttons */
+.idm-dialog.dark-modal .idm-btn {
+  background: #33333a;
+  border-color: #4e4e5a;
+  color: #f0f0f4;
+}
+
+.idm-dialog.dark-modal .idm-btn:hover:not(:disabled) {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #fff;
+}
+
+.idm-dialog.dark-modal .idm-btn.primary {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #fff;
+}
+
+/* IDM Tab Controls */
+.idm-tab-bar {
+  display: flex;
+  border-bottom: 1px solid #707070;
+  gap: 2px;
+  padding: 0 8px;
+  background: #e8e8e8;
+  overflow-x: auto;
+}
+
+.idm-dialog.dark-modal .idm-tab-bar {
+  background: #1c1c20;
+  border-bottom: 1px solid #44444e;
+}
+
+.idm-tab-btn {
+  padding: 6px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  color: #444;
+  font-size: 11.5px;
+  cursor: pointer;
+  border-top-left-radius: 3px;
+  border-top-right-radius: 3px;
+  position: relative;
+  top: 1px;
+}
+
+.idm-dialog.dark-modal .idm-tab-btn {
+  color: #a0a0ab;
+}
+
+.idm-tab-btn:hover {
+  color: #000;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.idm-dialog.dark-modal .idm-tab-btn:hover {
+  color: #fff;
+  background: #2a2a32;
+}
+
+.idm-tab-btn.active {
+  background: #f0f0f0;
+  color: #000;
+  border-color: #707070;
+  border-bottom: 1px solid #f0f0f0;
+  font-weight: 500;
+}
+
+.idm-dialog.dark-modal .idm-tab-btn.active {
+  background: #252528;
+  color: #fff;
+  border-color: #44444e;
+  border-bottom: 1px solid #252528;
+}
+
+/* Form Row Grid in Properties Dialog */
+.prop-row {
+  display: flex;
+  margin-bottom: 10px;
+  align-items: center;
+}
+
+.prop-label {
+  width: 90px;
+  color: #444;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.idm-dialog.dark-modal .prop-label {
+  color: #a5a5b2;
+}
+
+.prop-value {
+  flex: 1;
+  font-size: 12px;
+  color: #000;
+}
+
+.idm-dialog.dark-modal .prop-value {
+  color: #f1f1f5;
+}
+
+.prop-input {
+  flex: 1;
+  height: 24px;
+  padding: 2px 8px;
+  border: 1px solid #7a7a7a;
+  background: #fff;
+  color: #000;
+  font-size: 12px;
+  outline: none;
+}
+
+.idm-dialog.dark-modal .prop-input {
+  background: #18181b;
+  border-color: #484854;
+  color: #eee;
+}
+
+.prop-input:focus {
+  border-color: #0078d7;
+}
+
+.idm-dialog.dark-modal .prop-input:focus {
+  border-color: #38bdf8;
+}
+
+/* Chunk Progress Visualizer Modal */
+.chunk-strip-container {
+  display: flex;
+  gap: 2px;
+  height: 32px;
+  background: #111;
+  padding: 3px;
+  border: 1px solid #383842;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.chunk-segment {
+  flex: 1;
+  height: 100%;
+  background: #1e293b;
+  position: relative;
+  overflow: hidden;
+  border-radius: 2px;
+}
+
+.chunk-segment-fill {
+  height: 100%;
+  background: linear-gradient(180deg, #38bdf8 0%, #0284c7 100%);
+  transition: width 0.15s ease-out;
+}
+
+.chunk-segment-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 9px;
+  font-family: var(--font-mono);
+  font-weight: bold;
+  color: #fff;
+  text-shadow: 0 1px 2px #000;
+}
+
+/* Floating Web Video Sniffer Widget */
+.sniffer-floating-pill {
+  position: fixed;
+  top: 60px;
+  right: 20px;
+  background: linear-gradient(135deg, #1e293b, #0f172a);
+  border: 1px solid #38bdf8;
+  border-radius: 6px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.8), 0 0 15px rgba(56, 189, 248, 0.3);
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 10000;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+  animation: bounceIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+@keyframes bounceIn {
+  0% { transform: scale(0.6) translateY(-20px); opacity: 0; }
+  100% { transform: scale(1) translateY(0); opacity: 1; }
+}
+
+.sniffer-floating-pill:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.9), 0 0 22px rgba(56, 189, 248, 0.5);
+}

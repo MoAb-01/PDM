@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "IDM Pro Media Sniffer Companion (AB)",
+  "version": "6.42.1",
+  "description": "Companion media sniffer extension for Internet Download Manager AB. Sniffs HLS .m3u8, MPEG-DASH .mpd, video/audio chunks, and direct file streams.",
+  "permissions": [
+    "nativeMessaging",
+    "downloads",
+    "webRequest",
+    "storage",
+    "activeTab",
+    "scripting",
+    "cookies",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "IDM Media Sniffer"
+  }
+}
