@@ -644,9 +644,7 @@ private:
 
             // Lock-Free Inner Download Loop using WinHttpReadData
             while (m_running && WinHttpReadData(hRequest, buffer.data(), BUFFER_SIZE, &bytesRead) && bytesRead > 0) {
-                uint64_t nowMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()
-                ).count();
+                uint64_t nowMs = GetTickCount64();
 
                 if (segIndex < (int)m_segments.size()) {
                     m_segments[segIndex].state.store(StreamState::Receiving, std::memory_order_relaxed);
@@ -816,9 +814,7 @@ private:
             }
 
             // Real-Time Stall Detection: check if any receiving stream hasn't received a packet in >1000ms
-            uint64_t nowMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()
-            ).count();
+            uint64_t nowMs = GetTickCount64();
 
             bool allComplete = true;
             bool anyFailed = false;

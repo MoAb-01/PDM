@@ -149,11 +149,52 @@ std::vector<DownloadItem> DownloadEngine::GetDownloads() {
 }
 
 DownloadItem DownloadEngine::GetItem(const std::wstring& id) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    for (const auto& d : m_downloads) {
-        if (d.id == id) return d;
+    DownloadItem item;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& d : m_downloads) {
+            if (d.id == id) {
+                item = d;
+                found = true;
+                break;
+            }
+        }
     }
-    return DownloadItem{};
+    if (!found) return DownloadItem{};
+
+    std::shared_ptr<SegmentedDownloader> pDownloader = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_downloaderMutex);
+        auto it = m_activeDownloaders.find(id);
+        if (it != m_activeDownloaders.end()) {
+            pDownloader = it->second;
+        }
+    }
+
+    if (pDownloader && pDownloader->isRunning()) {
+        DownloadStats stats = pDownloader->getStats();
+        item.downloadedBytes = stats.downloadedBytes;
+        item.sizeBytes = stats.totalSize;
+        item.speedBytesPerSec = stats.smoothedSpeedBps;
+        item.diagnosticText = stats.diagnosticText;
+
+        item.chunks.clear();
+        for (const auto& st : stats.streams) {
+            DownloadChunk c;
+            c.id = st.id;
+            c.startByte = st.start;
+            c.endByte = st.end;
+            c.downloadedBytes = st.downloadedBytes;
+            c.active = (st.state == StreamState::Receiving || st.state == StreamState::Connecting || st.state == StreamState::WritingDisk);
+            c.completed = (st.state == StreamState::Completed);
+            c.state = (ChunkState)st.state;
+            c.latencyMs = st.latencyMs;
+            item.chunks.push_back(c);
+        }
+    }
+
+    return item;
 }
 
 void DownloadEngine::UpdateItem(const DownloadItem& item) {
