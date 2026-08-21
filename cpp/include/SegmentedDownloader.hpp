@@ -111,7 +111,7 @@ public:
             url.c_str(),
             L"Range: bytes=0-0\r\n",
             -1,
-            INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE,
+            INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE,
             0
         );
         if (!hConnect) {
@@ -180,7 +180,7 @@ public:
         if (!probeUrl(url, totalSize, supportsRange, fn) || totalSize == 0) {
             // Fallback probe without range
             if (m_hInternet) {
-                HINTERNET hUrl = InternetOpenUrlW(m_hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD, 0);
+                HINTERNET hUrl = InternetOpenUrlW(m_hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE, 0);
                 if (hUrl) {
                     DWORD cl = 0; DWORD clSize = sizeof(cl); DWORD idx = 0;
                     HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &cl, &clSize, &idx);
@@ -358,12 +358,18 @@ private:
     std::chrono::steady_clock::time_point m_lastEtaUpdateTime = std::chrono::steady_clock::now();
 
     HINTERNET m_hInternet = NULL;
+    std::mutex m_threadsMutex;
 
     void joinThreads() {
-        for (auto& t : m_workerThreads) {
+        std::vector<std::thread> threadsToJoin;
+        {
+            std::lock_guard<std::mutex> lock(m_threadsMutex);
+            threadsToJoin = std::move(m_workerThreads);
+            m_workerThreads.clear();
+        }
+        for (auto& t : threadsToJoin) {
             if (t.joinable()) t.join();
         }
-        m_workerThreads.clear();
         if (m_monitorThread.joinable()) m_monitorThread.join();
         if (m_hInternet) {
             InternetCloseHandle(m_hInternet);
@@ -435,7 +441,7 @@ private:
                 m_url.c_str(),
                 headers.empty() ? NULL : headers.c_str(),
                 -1,
-                INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE,
+                INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE,
                 0
             );
             if (!hUrl) {
@@ -479,35 +485,31 @@ private:
             InternetCloseHandle(hUrl);
 
             // Strict Segment Completion Check:
-            // A segment is ONLY complete if its byte pointer has strictly passed the end boundary!
             bool isTrulyComplete = false;
             if (m_supportsRange && endByte > 0) {
                 isTrulyComplete = (startByte > endByte);
             } else if (m_totalSize > 0) {
                 isTrulyComplete = (m_totalDownloadedBytes.load(std::memory_order_relaxed) >= m_totalSize);
             } else {
-                isTrulyComplete = !failed;
+                isTrulyComplete = (startByte > 0);
             }
 
-            if (!failed && m_running && isTrulyComplete) {
+            if (isTrulyComplete) {
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
                     if (segIndex < (int)m_segments.size()) {
                         m_segments[segIndex].status = SegmentStatus::Completed;
                     }
                 }
-
-                // Dynamic Segment Stealing: Check if we can steal work from another large segment
                 checkForSegmentStealing();
                 return;
-            }
-
-            // If we reached here without completing, connection was dropped or socket was broken!
-            retries++;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (segIndex < (int)m_segments.size()) {
-                    m_segments[segIndex].status = SegmentStatus::Pending;
+            } else {
+                retries++;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (segIndex < (int)m_segments.size()) {
+                        m_segments[segIndex].status = SegmentStatus::Pending;
+                    }
                 }
             }
 
@@ -530,48 +532,63 @@ private:
         }
     }
 
-    // Dynamic Segment Stealing: Splits the largest active incomplete segment in half
+    // Dynamic Segment Stealing: Non-blocking scoped micro-lock and external thread spawn
     void checkForSegmentStealing() {
         if (!m_supportsRange || !m_running) return;
 
-        std::lock_guard<std::mutex> lock(m_mutex);
         int targetIdx = -1;
         uint64_t maxRemaining = 0;
 
-        for (int i = 0; i < (int)m_segments.size(); ++i) {
-            const auto& seg = m_segments[i];
-            if (seg.status == SegmentStatus::Downloading && seg.end > seg.start) {
-                uint64_t totalSegSize = (seg.end - seg.start) + 1;
-                uint64_t curDownloaded = seg.downloadedBytes.load(std::memory_order_relaxed);
-                uint64_t rem = (totalSegSize > curDownloaded) ? (totalSegSize - curDownloaded) : 0;
-                if (rem > 1024 * 1024 && rem > maxRemaining) { // Split if at least 1MB left
-                    maxRemaining = rem;
-                    targetIdx = i;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (int i = 0; i < (int)m_segments.size(); ++i) {
+                const auto& seg = m_segments[i];
+                if (seg.status == SegmentStatus::Downloading && seg.end > seg.start) {
+                    uint64_t totalSegSize = (seg.end - seg.start) + 1;
+                    uint64_t curDownloaded = seg.downloadedBytes.load(std::memory_order_relaxed);
+                    uint64_t rem = (totalSegSize > curDownloaded) ? (totalSegSize - curDownloaded) : 0;
+                    if (rem > 1024 * 1024 && rem > maxRemaining) { // Split if at least 1MB left
+                        maxRemaining = rem;
+                        targetIdx = i;
+                    }
                 }
             }
         }
 
-        if (targetIdx >= 0) {
-            auto& oldSeg = m_segments[targetIdx];
-            uint64_t curPos = oldSeg.start + oldSeg.downloadedBytes.load(std::memory_order_relaxed);
-            uint64_t splitPoint = curPos + (maxRemaining / 2);
+        if (targetIdx < 0) return;
 
-            if (splitPoint < oldSeg.end) {
-                SegmentState newSeg;
-                newSeg.id = (int)m_segments.size();
-                newSeg.start = splitPoint;
-                newSeg.end = oldSeg.end;
-                newSeg.downloadedBytes.store(0, std::memory_order_relaxed);
-                newSeg.status = SegmentStatus::Pending;
+        int newIdx = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (targetIdx < (int)m_segments.size()) {
+                auto& oldSeg = m_segments[targetIdx];
+                if (oldSeg.status == SegmentStatus::Downloading) {
+                    uint64_t curPos = oldSeg.start + oldSeg.downloadedBytes.load(std::memory_order_relaxed);
+                    uint64_t rem = (oldSeg.end > curPos) ? (oldSeg.end - curPos) : 0;
+                    if (rem > 1024 * 1024) {
+                        uint64_t splitPoint = curPos + (rem / 2);
+                        if (splitPoint < oldSeg.end) {
+                            SegmentState newSeg;
+                            newSeg.id = (int)m_segments.size();
+                            newSeg.start = splitPoint;
+                            newSeg.end = oldSeg.end;
+                            newSeg.downloadedBytes.store(0, std::memory_order_relaxed);
+                            newSeg.status = SegmentStatus::Pending;
 
-                oldSeg.end = splitPoint - 1;
+                            oldSeg.end = splitPoint - 1;
 
-                m_segments.push_back(newSeg);
-                int newIdx = (int)m_segments.size() - 1;
-
-                // Spawn worker for stolen half
-                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, newIdx);
+                            m_segments.push_back(newSeg);
+                            newIdx = (int)m_segments.size() - 1;
+                        }
+                    }
+                }
             }
+        }
+
+        // Spawn worker thread OUTSIDE m_mutex (using dedicated m_threadsMutex)
+        if (newIdx >= 0) {
+            std::lock_guard<std::mutex> lock(m_threadsMutex);
+            m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, newIdx);
         }
     }
 
