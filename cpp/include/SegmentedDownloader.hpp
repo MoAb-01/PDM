@@ -563,7 +563,9 @@ private:
                 seg.state.store(StreamState::Connecting, std::memory_order_relaxed);
             }
 
-            if (!m_hConnect) {
+            // Isolated connection handle per thread for true parallel non-blocking TCP socket concurrency
+            HINTERNET hThreadConnect = WinHttpConnect(m_hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
+            if (!hThreadConnect) {
                 retries++;
                 std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
                 continue;
@@ -571,7 +573,7 @@ private:
 
             DWORD flags = m_pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
             HINTERNET hRequest = WinHttpOpenRequest(
-                m_hConnect,
+                hThreadConnect,
                 L"GET",
                 m_pUrl.path.c_str(),
                 NULL,
@@ -581,6 +583,7 @@ private:
             );
 
             if (!hRequest) {
+                WinHttpCloseHandle(hThreadConnect);
                 retries++;
                 std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
                 continue;
@@ -605,6 +608,7 @@ private:
             if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
                 !WinHttpReceiveResponse(hRequest, NULL)) {
                 WinHttpCloseHandle(hRequest);
+                WinHttpCloseHandle(hThreadConnect);
                 retries++;
                 std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
                 continue;
@@ -658,6 +662,7 @@ private:
 
             CloseHandle(hFile);
             WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hThreadConnect);
 
             // Strict Segment Completion Check:
             bool isTrulyComplete = false;

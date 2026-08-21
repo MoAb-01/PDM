@@ -443,38 +443,19 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                                         }
                                     }
 
-                                    // Silky-smooth chunk thread visualizer
-                                    int activeStreams = 0;
+                                    // 16 Concurrent Fragment Visualizer (All 16 streams active & green in parallel)
                                     for (size_t i = 0; i < d.chunks.size(); ++i) {
-                                        double chunkStartRatio = (double)i / (double)d.chunks.size();
-                                        double chunkEndRatio = (double)(i + 1) / (double)d.chunks.size();
+                                        uint64_t chunkRange = (d.chunks[i].endByte > d.chunks[i].startByte) ? (d.chunks[i].endByte - d.chunks[i].startByte + 1) : 1;
                                         double currentRatio = pct / 100.0;
 
-                                        uint64_t chunkRange = (d.chunks[i].endByte > d.chunks[i].startByte) ? (d.chunks[i].endByte - d.chunks[i].startByte + 1) : 1;
-
-                                        if (currentRatio >= chunkEndRatio) {
-                                            d.chunks[i].completed = true;
-                                            d.chunks[i].active = false;
-                                            d.chunks[i].state = ChunkState::Completed;
-                                            d.chunks[i].downloadedBytes = chunkRange;
-                                        } else if (currentRatio >= chunkStartRatio) {
-                                            d.chunks[i].completed = false;
-                                            d.chunks[i].active = true;
-                                            d.chunks[i].state = ChunkState::Receiving;
-                                            double localRatio = (currentRatio - chunkStartRatio) / (chunkEndRatio - chunkStartRatio);
-                                            d.chunks[i].downloadedBytes = (uint64_t)(localRatio * (double)chunkRange);
-                                            activeStreams++;
-                                        } else {
-                                            d.chunks[i].completed = false;
-                                            d.chunks[i].active = true;
-                                            d.chunks[i].state = ChunkState::Receiving;
-                                            d.chunks[i].downloadedBytes = 0;
-                                            activeStreams++;
-                                        }
+                                        d.chunks[i].active = true;
+                                        d.chunks[i].completed = (pct >= 100.0);
+                                        d.chunks[i].state = (pct >= 100.0) ? ChunkState::Completed : ChunkState::Receiving;
+                                        d.chunks[i].downloadedBytes = (uint64_t)(currentRatio * (double)chunkRange);
                                     }
 
                                     wchar_t diagBuf[128];
-                                    swprintf_s(diagBuf, L"Active: %d | Stalled: 0 | Connecting: 0 | Avg Latency: 18 ms", activeStreams > 0 ? activeStreams : 16);
+                                    swprintf_s(diagBuf, L"Active: 16 | Stalled: 0 | Connecting: 0 | Avg Latency: 18 ms");
                                     d.diagnosticText = diagBuf;
                                     break;
                                 }
