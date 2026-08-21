@@ -89,12 +89,32 @@ public:
     }
 
     bool probeUrl(const std::wstring& url, uint64_t& outSize, bool& outSupportsRange, std::wstring& outFileName) {
-        HINTERNET hInternet = InternetOpenW(L"AB Download Manager 1.0 (Native C++ Engine)", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-        if (!hInternet) return false;
+        if (!m_hInternet) {
+            DWORD maxConns = 64;
+            InternetSetOptionW(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
+            InternetSetOptionW(NULL, INTERNET_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
 
-        HINTERNET hConnect = InternetOpenUrlW(hInternet, url.c_str(), L"Range: bytes=0-0\r\n", -1, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+            m_hInternet = InternetOpenW(L"AB Download Manager 1.0 (Native C++ Engine)", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+            if (m_hInternet) {
+                DWORD timeoutMs = 5000;
+                InternetSetOptionW(m_hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+                InternetSetOptionW(m_hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+                InternetSetOptionW(m_hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+                DWORD retries = 2;
+                InternetSetOptionW(m_hInternet, INTERNET_OPTION_CONNECT_RETRIES, &retries, sizeof(retries));
+            }
+        }
+        if (!m_hInternet) return false;
+
+        HINTERNET hConnect = InternetOpenUrlW(
+            m_hInternet,
+            url.c_str(),
+            L"Range: bytes=0-0\r\n",
+            -1,
+            INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE,
+            0
+        );
         if (!hConnect) {
-            InternetCloseHandle(hInternet);
             return false;
         }
 
@@ -131,7 +151,6 @@ public:
         }
 
         InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
         return true;
     }
 
@@ -154,22 +173,20 @@ public:
         m_lastEtaUpdateTime = std::chrono::steady_clock::now();
         m_samples.clear();
 
-        // 1. Probe Server
+        // 1. Probe Server with shared session handle
         uint64_t totalSize = 0;
         bool supportsRange = false;
         std::wstring fn;
         if (!probeUrl(url, totalSize, supportsRange, fn) || totalSize == 0) {
             // Fallback probe without range
-            HINTERNET hInternet = InternetOpenW(L"IDM AB Probe", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-            if (hInternet) {
-                HINTERNET hUrl = InternetOpenUrlW(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
+            if (m_hInternet) {
+                HINTERNET hUrl = InternetOpenUrlW(m_hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD, 0);
                 if (hUrl) {
                     DWORD cl = 0; DWORD clSize = sizeof(cl); DWORD idx = 0;
                     HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &cl, &clSize, &idx);
                     totalSize = cl;
                     InternetCloseHandle(hUrl);
                 }
-                InternetCloseHandle(hInternet);
             }
         }
 
@@ -340,8 +357,7 @@ private:
     std::chrono::steady_clock::time_point m_speedDropStartTime = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point m_lastEtaUpdateTime = std::chrono::steady_clock::now();
 
-    // Speed Hysteresis state
-    double m_prevDisplayBps = 0.0;
+    HINTERNET m_hInternet = NULL;
 
     void joinThreads() {
         for (auto& t : m_workerThreads) {
@@ -349,6 +365,10 @@ private:
         }
         m_workerThreads.clear();
         if (m_monitorThread.joinable()) m_monitorThread.join();
+        if (m_hInternet) {
+            InternetCloseHandle(m_hInternet);
+            m_hInternet = NULL;
+        }
     }
 
     // High-performance pre-allocation using FileAllocationInfo
@@ -399,24 +419,28 @@ private:
                 seg.status = SegmentStatus::Downloading;
             }
 
-            // Perform HTTP Range request
-            HINTERNET hInternet = InternetOpenW(L"IDM AB Worker", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-            if (!hInternet) {
-                retries++;
-                std::this_thread::sleep_for(std::chrono::seconds(1 << retries));
-                continue;
-            }
-
             std::wstring headers;
             if (m_supportsRange && endByte > 0) {
                 headers = L"Range: bytes=" + std::to_wstring(startByte) + L"-" + std::to_wstring(endByte) + L"\r\n";
             }
 
-            HINTERNET hUrl = InternetOpenUrlW(hInternet, m_url.c_str(), headers.empty() ? NULL : headers.c_str(), -1, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
-            if (!hUrl) {
-                InternetCloseHandle(hInternet);
+            if (!m_hInternet) {
                 retries++;
-                std::this_thread::sleep_for(std::chrono::seconds(1 << retries));
+                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
+                continue;
+            }
+
+            HINTERNET hUrl = InternetOpenUrlW(
+                m_hInternet,
+                m_url.c_str(),
+                headers.empty() ? NULL : headers.c_str(),
+                -1,
+                INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE,
+                0
+            );
+            if (!hUrl) {
+                retries++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (1 << retries)));
                 continue;
             }
 
@@ -424,7 +448,6 @@ private:
             HANDLE hFile = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile == INVALID_HANDLE_VALUE) {
                 InternetCloseHandle(hUrl);
-                InternetCloseHandle(hInternet);
                 return;
             }
 
@@ -454,7 +477,6 @@ private:
 
             CloseHandle(hFile);
             InternetCloseHandle(hUrl);
-            InternetCloseHandle(hInternet);
 
             // Strict Segment Completion Check:
             // A segment is ONLY complete if its byte pointer has strictly passed the end boundary!
