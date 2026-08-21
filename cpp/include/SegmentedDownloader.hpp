@@ -287,13 +287,26 @@ public:
             }
         }
 
-        // 4. Spawn Worker Threads
+        // 4. Staggered Connection Ramp-Up (Instant Start)
+        // Stream #0 launches immediately so bytes stream in <10ms and UI shows instant progress
         {
             std::lock_guard<std::mutex> lock(m_threadsMutex);
             m_workerThreads.clear();
-            for (int i = 0; i < (int)m_segments.size(); ++i) {
-                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, i);
+            if (!m_segments.empty()) {
+                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, 0);
             }
+        }
+
+        // Remaining streams launch sequentially in background with 75ms stagger
+        if (m_segments.size() > 1) {
+            m_rampUpThread = std::thread([this]() {
+                for (size_t i = 1; i < m_segments.size() && m_running; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(75));
+                    if (!m_running) break;
+                    std::lock_guard<std::mutex> lock(m_threadsMutex);
+                    m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, (int)i);
+                }
+            });
         }
 
         // 5. Spawn Monitor & Speed Calculator Thread
@@ -421,8 +434,12 @@ private:
     HINTERNET m_hSession = NULL;
     HINTERNET m_hConnect = NULL;
     std::mutex m_threadsMutex;
+    std::thread m_rampUpThread;
 
     void joinThreads() {
+        if (m_rampUpThread.joinable()) {
+            m_rampUpThread.join();
+        }
         std::vector<std::thread> threadsToJoin;
         {
             std::lock_guard<std::mutex> lock(m_threadsMutex);
@@ -679,10 +696,35 @@ private:
     }
 
     void monitorWorker() {
+        uint64_t prevDownloaded = m_totalDownloadedBytes.load(std::memory_order_relaxed);
+        auto lastSampleTime = std::chrono::steady_clock::now();
+
         while (m_running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(30)); // 33 Hz high-frequency real-time sampling
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Decoupled 100ms speed sampler
 
             uint64_t totalDownloaded = m_totalDownloadedBytes.load(std::memory_order_relaxed);
+            auto now = std::chrono::steady_clock::now();
+            auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSampleTime).count();
+            if (dtMs <= 0) dtMs = 1;
+
+            uint64_t deltaBytes = (totalDownloaded >= prevDownloaded) ? (totalDownloaded - prevDownloaded) : 0;
+            prevDownloaded = totalDownloaded;
+            lastSampleTime = now;
+
+            if (deltaBytes == 0) {
+                m_instantSpeed = 0;
+                // Graceful exponential decay towards 0 instead of freezing UI
+                m_smoothedSpeed *= 0.70;
+                if (m_smoothedSpeed < 10.0) m_smoothedSpeed = 0.0;
+            } else {
+                m_instantSpeed = (deltaBytes * 1000) / dtMs;
+                if (m_smoothedSpeed == 0.0) {
+                    m_smoothedSpeed = (double)m_instantSpeed;
+                } else {
+                    m_smoothedSpeed = 0.25 * (double)m_instantSpeed + 0.75 * m_smoothedSpeed;
+                }
+            }
+
             bool allComplete = true;
             bool anyFailed = false;
 
@@ -707,34 +749,6 @@ private:
                 savePartialMetadata();
                 if (m_callback) m_callback(getStats());
                 break;
-            }
-
-            auto now = std::chrono::steady_clock::now();
-
-            // Maintain 2-second sliding window
-            m_samples.push_back({ now, totalDownloaded });
-            while (!m_samples.empty()) {
-                auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_samples.front().time).count();
-                if (age > 2000 && m_samples.size() > 2) {
-                    m_samples.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            if (m_samples.size() >= 2) {
-                auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_samples.front().time).count();
-                if (dt > 0) {
-                    uint64_t dBytes = totalDownloaded - m_samples.front().bytes;
-                    m_instantSpeed = (dBytes * 1000) / dt;
-
-                    // Exponential Moving Average (EMA): smoothed = 0.20 * instant + 0.80 * smoothed
-                    if (m_smoothedSpeed == 0.0) {
-                        m_smoothedSpeed = (double)m_instantSpeed;
-                    } else {
-                        m_smoothedSpeed = 0.20 * (double)m_instantSpeed + 0.80 * m_smoothedSpeed;
-                    }
-                }
             }
 
             if (m_callback) {
