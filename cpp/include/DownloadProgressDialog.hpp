@@ -14,4 +14,5 @@
 #pragma comment(lib, "comctl32.lib")
 
 // Shows the pure Win32 IDM Download Progress Dialog
+void ShowDownloadProgressDialog(HWND hParent, const DownloadItem& item, DownloadEngine* pEngine = nullptr);
 void ShowDownloadProgressDialog(HWND hParent, DownloadItem* pItem, DownloadEngine* pEngine = nullptr);

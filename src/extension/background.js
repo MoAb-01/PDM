@@ -110,7 +110,7 @@ if (chrome.webRequest && chrome.webRequest.onResponseStarted) {
                   chrome.tabs.sendMessage(tabId, {
                     type: "IDM_MEDIA_DETECTED",
                     media: mediaItem
-                  }).catch(() => {});
+                  }).catch(() => { });
                 }
               } catch (e) {
                 // Ignore tab message errors
@@ -131,49 +131,158 @@ console.log("=========================================");
 console.log("[IDM Extension] Active Extension ID:", chrome.runtime?.id || "unknown");
 console.log("=========================================");
 
-// Centralized forward function (Dual-Channel: HTTP Bridge + Native Messaging Host)
-function forwardDownloadToIdmApp(stream) {
+// Debounce & deduplication cache to prevent duplicate popups
+let lastDownloadUrl = "";
+let lastDownloadTime = 0;
+
+async function resolveTabTitleIfMissing(stream) {
+  if (stream.filename && stream.filename !== "watch" && stream.filename !== "download.bin" && stream.filename !== "video") {
+    return stream.filename;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tabs && tabs[0] && tabs[0].title) {
+      let t = tabs[0].title
+        .replace(/^[\u200e\u200f\s]*\(\d+\)[\u200e\u200f\s]*/g, "")
+        .replace(/[\s\u200e\u200f]*[-–—][\s\u200e\u200f]*YouTube$/i, "")
+        .replace(/[\s\u200e\u200f]*[|][-–—][\s\u200e\u200f]*Facebook$/i, "")
+        .replace(/[\s\u200e\u200f]*[|][\s\u200e\u200f]*TikTok$/i, "")
+        .replace(/[\s\u200e\u200f]*•[\s\u200e\u200f]*Instagram.*$/i, "")
+        .replace(/[\s\u200e\u200f]*\/[\s\u200e\u200f]*X$/i, "")
+        .trim();
+      let clean = t.replace(/[\/\\:*?"<>|]/g, " ").replace(/\s+/g, " ").trim();
+      if (clean.length > 120) clean = clean.substring(0, 120).trim();
+      if (clean && clean.length > 2) {
+        return clean + ".mp4";
+      }
+    }
+  } catch (e) {}
+  return stream.filename || "";
+}
+
+function isCloudflareOrProtected(url) {
+  if (!url || typeof url !== "string") return false;
+  const u = url.toLowerCase();
+  return (
+    u.includes("overleaf.com") ||
+    u.includes("/download/project/") ||
+    u.includes("cloudflare") ||
+    u.includes("challenges.cloudflare.com") ||
+    u.includes("cf-browser-verification")
+  );
+}
+
+function getCategoryFolderForFilename(filename, mimeType) {
+  if (!filename) filename = "";
+  const ext = filename.split(".").pop().toLowerCase();
+
+  if (["mp4", "mkv", "avi", "mov", "webm", "flv", "ts", "m4v"].includes(ext) || (mimeType && mimeType.includes("video"))) {
+    return "Video";
+  }
+  if (["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma"].includes(ext) || (mimeType && mimeType.includes("audio"))) {
+    return "Music";
+  }
+  if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"].includes(ext) || (mimeType && (mimeType.includes("zip") || mimeType.includes("compressed") || mimeType.includes("archive")))) {
+    return "Compressed";
+  }
+  if (["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "csv"].includes(ext) || (mimeType && (mimeType.includes("pdf") || mimeType.includes("document") || mimeType.includes("text")))) {
+    return "Documents";
+  }
+  if (["exe", "msi", "bat", "cmd", "apk", "dmg", "pkg"].includes(ext)) {
+    return "Programs";
+  }
+  return "General";
+}
+
+// Centralized forward function (Primary: HTTP Bridge | Fallback: Native Messaging Host)
+async function forwardDownloadToIdmApp(stream) {
+  if (!stream || !stream.url) return;
+
+  const now = Date.now();
+  if (stream.url === lastDownloadUrl && (now - lastDownloadTime) < 1500) {
+    console.log("[IDM Extension] Duplicate download request suppressed:", stream.url);
+    return;
+  }
+  lastDownloadUrl = stream.url;
+  lastDownloadTime = now;
+
+  const resolvedFilename = await resolveTabTitleIfMissing(stream);
+
+  let cookieHeader = "";
+  try {
+    const u = new URL(stream.url);
+    const domain = u.hostname.replace(/^www\./, "");
+    const [c1, c2, c3] = await Promise.all([
+      chrome.cookies.getAll({ url: stream.url }).catch(() => []),
+      chrome.cookies.getAll({ url: "https://" + u.hostname + "/" }).catch(() => []),
+      chrome.cookies.getAll({ domain: domain }).catch(() => [])
+    ]);
+    const cookieMap = new Map();
+    [...(c1 || []), ...(c2 || []), ...(c3 || [])].forEach(c => {
+      if (c && c.name && !cookieMap.has(c.name)) {
+        cookieMap.set(c.name, c.value);
+      }
+    });
+    const parts = [];
+    cookieMap.forEach((val, name) => parts.push(`${name}=${val}`));
+    cookieHeader = parts.join("; ");
+    console.log("[IDM] Cookie header built (" + parts.length + " cookies):", cookieHeader);
+  } catch (e) {
+    console.error("[IDM] Error harvesting cookies:", e);
+  }
+
+  let referer = stream.referer || stream.referrer || stream.initiator || "";
+  if (!referer && chrome.tabs) {
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tabs && tabs[0] && tabs[0].url) referer = tabs[0].url;
+    } catch (e) {}
+  }
+
   console.log("[IDM Extension] Forwarding download to IDM Application:", stream);
 
   const payload = {
     url: stream.url || "",
-    filename: stream.filename || "",
-    referer: stream.referer || stream.referrer || stream.initiator || "",
-    mimeType: stream.mimeType || stream.mime || ""
+    originalPageUrl: stream.originalPageUrl || "",
+    filename: resolvedFilename,
+    referer: referer,
+    mimeType: stream.mimeType || stream.mime || "",
+    quality: stream.quality || "",
+    cookies: cookieHeader,
+    userAgent: navigator.userAgent
   };
 
-  // 1. Direct Local HTTP Bridge (Instant zero-config popup when IDM app is running)
-  fetch("http://127.0.0.1:8989/download", {
+  // 1. Direct Local HTTP Bridge (Primary fast channel when IDM app is running)
+  fetch("http://127.0.0.1:9898/download", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   })
-  .then(res => res.json())
-  .then(data => {
-    console.log("[IDM Extension] Local HTTP Bridge Response:", data);
-  })
-  .catch(err => {
-    console.log("[IDM Extension] Local HTTP Bridge unavailable (app might be closed), invoking Native Host...");
-  });
-
-  // 2. Chrome Native Messaging Host (Auto-launches DownloadManagerAB.exe if closed)
-  if (chrome.runtime && chrome.runtime.sendNativeMessage) {
-    try {
-      chrome.runtime.sendNativeMessage(
-        "com.idm.nativehost",
-        payload,
-        (response) => {
-          if (chrome.runtime.lastError) {
-            console.warn("[IDM Native Host Message]", chrome.runtime.lastError.message);
-          } else {
-            console.log("[IDM Native Host Response]:", response);
-          }
+    .then(res => res.json())
+    .then(data => {
+      console.log("[IDM Extension] Local HTTP Bridge Response:", data);
+    })
+    .catch(err => {
+      // 2. Native Messaging Host fallback (Only invoked if HTTP bridge fails / app is closed)
+      console.log("[IDM Extension] Local HTTP Bridge unavailable, invoking Native Host fallback...");
+      if (chrome.runtime && chrome.runtime.sendNativeMessage) {
+        try {
+          chrome.runtime.sendNativeMessage(
+            "com.idm.nativehost",
+            payload,
+            (response) => {
+              if (chrome.runtime.lastError) {
+                console.warn("[IDM Native Host Message]", chrome.runtime.lastError.message);
+              } else {
+                console.log("[IDM Native Host Response]:", response);
+              }
+            }
+          );
+        } catch (e) {
+          console.warn("[IDM Native Host Exception]", e);
         }
-      );
-    } catch (e) {
-      console.warn("[IDM Native Host Exception]", e);
-    }
-  }
+      }
+    });
 }
 
 // Communication with popup and content script
@@ -194,17 +303,17 @@ if (chrome.runtime && chrome.runtime.onMessage) {
   });
 }
 
-// Intercept browser downloads and forward to IDM
+// Intercept browser downloads and route appropriately
 if (chrome.downloads && chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
     if (!downloadItem || !downloadItem.url) return;
 
-    console.log("[IDM Extension] Intercepted browser download:", downloadItem.url);
+    console.log("[IDM Extension] Intercepted browser download:", downloadItem.url, "Filename:", downloadItem.filename);
 
-    // Must call suggest() to signal we handled it, then cancel the Chrome download
+    // Call suggest first
     suggest({ filename: downloadItem.filename || "download" });
 
-    // Cancel and erase the Chrome-managed download after a short delay
+    // Cancel Chrome-managed download after a short delay so IDM takes over
     setTimeout(() => {
       try {
         chrome.downloads.cancel(downloadItem.id, () => {
@@ -218,12 +327,13 @@ if (chrome.downloads && chrome.downloads.onDeterminingFilename) {
       }
     }, 200);
 
-    // Forward to C++ app via HTTP bridge
+    // Forward to C++ app with cookies, referer and userAgent
     forwardDownloadToIdmApp({
       url: downloadItem.url,
       filename: downloadItem.filename,
       referer: downloadItem.referrer || downloadItem.finalUrl || "",
       mimeType: downloadItem.mime || ""
     });
+    return true;
   });
 }

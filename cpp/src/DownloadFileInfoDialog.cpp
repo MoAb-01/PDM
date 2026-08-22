@@ -1,10 +1,14 @@
 #include "../include/Models.hpp"
+#include "../include/DownloadEngine.hpp"
+#include "../include/SegmentedDownloader.hpp"
+#include "../include/IconFactory.hpp"
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <sstream>
 #include <iomanip>
+#include <thread>
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
@@ -32,6 +36,19 @@ inline std::wstring GetDefaultDownloadsFolder() {
     return L"C:\\Downloads\\";
 }
 
+static std::wstring FormatFileSizeDisplay(uint64_t bytes) {
+    if (bytes == 0) return L"Unknown size";
+    wchar_t buf[64];
+    if (bytes >= 1024ULL * 1024ULL * 1024ULL) {
+        swprintf_s(buf, 64, L"%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL * 1024ULL) {
+        swprintf_s(buf, 64, L"%.2f MB", (double)bytes / (1024.0 * 1024.0));
+    } else {
+        swprintf_s(buf, 64, L"%.2f KB", (double)bytes / 1024.0);
+    }
+    return buf;
+}
+
 struct DownloadFileInfoState {
     DownloadItem* pItem = nullptr;
     bool startImmediately = true;
@@ -42,6 +59,10 @@ struct DownloadFileInfoState {
     HWND hSaveEdit = NULL;
     HWND hPathBox = NULL;
     HWND hDescEdit = NULL;
+    HWND hCatIconPic = NULL;
+    HWND hSizeLabel = NULL;
+    HWND hPreviewBtn = NULL;
+    HICON hCurrentCatIcon = NULL;
     std::wstring baseDownloads;
 };
 
@@ -59,9 +80,19 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
     case WM_CREATE: {
         HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
+        // Top App Logo
+        HICON hAppLogo = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 18, 18, LR_LOADFROMFILE);
+        if (!hAppLogo) {
+            hAppLogo = (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico", IMAGE_ICON, 18, 18, LR_LOADFROMFILE);
+        }
+        if (hAppLogo) {
+            SendMessageW(hWnd, WM_SETICON, ICON_BIG, (LPARAM)hAppLogo);
+            SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)hAppLogo);
+        }
+
         // URL row
         HWND hUrlLbl = CreateWindowW(L"STATIC", L"URL", WS_CHILD | WS_VISIBLE, 18, 18, 70, 18, hWnd, NULL, NULL, NULL);
-        pState->hUrlEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pState->pItem->url.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 90, 16, 390, 22, hWnd, (HMENU)101, NULL, NULL);
+        pState->hUrlEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pState->pItem->url.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 90, 16, 375, 22, hWnd, (HMENU)101, NULL, NULL);
 
         // Category row
         HWND hCatLbl = CreateWindowW(L"STATIC", L"Category", WS_CHILD | WS_VISIBLE, 18, 48, 70, 18, hWnd, NULL, NULL, NULL);
@@ -70,8 +101,8 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
 
         // Save As row
         HWND hSaveLbl = CreateWindowW(L"STATIC", L"Save As", WS_CHILD | WS_VISIBLE, 18, 78, 70, 18, hWnd, NULL, NULL, NULL);
-        pState->hSaveEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pState->pItem->savePath.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 90, 76, 350, 22, hWnd, (HMENU)103, NULL, NULL);
-        HWND hBrowseBtn = CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 448, 75, 32, 24, hWnd, (HMENU)201, NULL, NULL);
+        pState->hSaveEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pState->pItem->savePath.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 90, 76, 340, 22, hWnd, (HMENU)103, NULL, NULL);
+        HWND hBrowseBtn = CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 436, 75, 28, 24, hWnd, (HMENU)201, NULL, NULL);
 
         // Checkbox: Remember path
         HWND hChkRem = CreateWindowW(L"BUTTON", L"Remember this path for \"Selected\" category", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 90, 106, 350, 18, hWnd, (HMENU)105, NULL, NULL);
@@ -79,16 +110,23 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
 
         // Folder preview box
         std::wstring catDir = pState->baseDownloads + (pState->pItem->category.empty() ? L"General" : pState->pItem->category) + L"\\";
-        pState->hPathBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", catDir.c_str(), WS_CHILD | WS_VISIBLE | ES_READONLY, 90, 128, 390, 22, hWnd, (HMENU)104, NULL, NULL);
+        pState->hPathBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", catDir.c_str(), WS_CHILD | WS_VISIBLE | ES_READONLY, 90, 128, 375, 22, hWnd, (HMENU)104, NULL, NULL);
 
         // Description row
         HWND hDescLbl = CreateWindowW(L"STATIC", L"Description", WS_CHILD | WS_VISIBLE, 18, 160, 70, 18, hWnd, NULL, NULL, NULL);
-        pState->hDescEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pState->pItem->description.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 90, 158, 390, 22, hWnd, (HMENU)106, NULL, NULL);
+        pState->hDescEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pState->pItem->description.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 90, 158, 375, 22, hWnd, (HMENU)106, NULL, NULL);
 
-        // Action buttons at bottom
-        HWND hLaterBtn = CreateWindowW(L"BUTTON", L"Download Later", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 90, 235, 110, 26, hWnd, (HMENU)301, NULL, NULL);
-        HWND hStartBtn = CreateWindowW(L"BUTTON", L"Start Download", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 210, 235, 120, 26, hWnd, (HMENU)IDOK, NULL, NULL);
-        HWND hCancelBtn = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 340, 235, 80, 26, hWnd, (HMENU)IDCANCEL, NULL, NULL);
+        // Right side: Category Icon, File Size, Preview Button
+        pState->hCatIconPic = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ICON, 495, 24, 48, 48, hWnd, (HMENU)107, NULL, NULL);
+        
+        std::wstring sizeText = FormatFileSizeDisplay(pState->pItem->sizeBytes);
+        pState->hSizeLabel = CreateWindowW(L"STATIC", sizeText.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTER, 470, 78, 100, 18, hWnd, (HMENU)108, NULL, NULL);
+        pState->hPreviewBtn = CreateWindowW(L"BUTTON", L"Preview", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 485, 102, 70, 24, hWnd, (HMENU)202, NULL, NULL);
+
+        // Action buttons at bottom (tightened closer to the content rows)
+        HWND hLaterBtn = CreateWindowW(L"BUTTON", L"Download Later", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 100, 195, 110, 26, hWnd, (HMENU)301, NULL, NULL);
+        HWND hStartBtn = CreateWindowW(L"BUTTON", L"Start Download", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 220, 195, 120, 26, hWnd, (HMENU)IDOK, NULL, NULL);
+        HWND hCancelBtn = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 350, 195, 80, 26, hWnd, (HMENU)IDCANCEL, NULL, NULL);
 
         // Set fonts
         SendMessageW(hUrlLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -103,6 +141,8 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
         SendMessageW(pState->hPathBox, WM_SETFONT, (WPARAM)hFont, TRUE);
         SendMessageW(hDescLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
         SendMessageW(pState->hDescEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(pState->hSizeLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(pState->hPreviewBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
         SendMessageW(hLaterBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
         SendMessageW(hStartBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
         SendMessageW(hCancelBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -123,6 +163,150 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
         else if (pState->pItem->category == L"Video") sel = 5;
         SendMessageW(pState->hCatCombo, CB_SETCURSEL, sel, 0);
 
+        // Set initial category icon (check extension for dedicated badges like PDF, DOCX)
+        std::wstring initialCat = pState->pItem->category.empty() ? L"General" : pState->pItem->category;
+        std::wstring fn = pState->pItem->filename;
+        size_t dotPos = fn.find_last_of(L'.');
+        if (dotPos != std::wstring::npos) {
+            std::wstring ext = fn.substr(dotPos + 1);
+            for (auto& c : ext) c = towlower(c);
+            if (ext == L"pdf") initialCat = L"PDF";
+            else if (ext == L"docx" || ext == L"doc") initialCat = L"DOCX";
+        }
+        pState->hCurrentCatIcon = IconFactory::CreateCategoryIcon(44, initialCat);
+        if (pState->hCurrentCatIcon) {
+            SendMessageW(pState->hCatIconPic, STM_SETICON, (WPARAM)pState->hCurrentCatIcon, 0);
+        }
+
+        // If it's a streaming URL, probe and update real title and approximate filesize
+        if (DownloadEngine::IsStreamingMediaURL(pState->pItem->url)) {
+            std::wstring url = pState->pItem->url;
+            HWND hSave = pState->hSaveEdit;
+            HWND hSize = pState->hSizeLabel;
+            std::wstring baseDir = catDir;
+            DownloadItem* pTargetItem = pState->pItem;
+
+            std::thread([url, hSave, hSize, baseDir, pTargetItem, hWnd]() {
+                wchar_t szPath[MAX_PATH] = { 0 };
+                GetModuleFileNameW(NULL, szPath, MAX_PATH);
+                PathRemoveFileSpecW(szPath);
+                std::wstring ytDlp = std::wstring(szPath) + L"\\..\\..\\tools\\yt-dlp.exe";
+                if (!PathFileExistsW(ytDlp.c_str())) ytDlp = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
+
+                std::wstring cmd = L"\"" + ytDlp + L"\" --no-playlist --no-warnings --print \"%(title)s\" --print \"%(filesize,filesize_approx)s\" \"" + url + L"\"";
+
+                SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+                HANDLE hReadPipe, hWritePipe;
+                if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
+                SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+                STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+                si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+                si.hStdOutput = hWritePipe;
+                si.hStdError = hWritePipe;
+                si.wShowWindow = SW_HIDE;
+
+                PROCESS_INFORMATION pi = { 0 };
+                std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+                cmdBuf.push_back(0);
+
+                BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+                CloseHandle(hWritePipe);
+
+                if (!success) {
+                    CloseHandle(hReadPipe);
+                    return;
+                }
+
+                std::string out;
+                char buffer[1024];
+                DWORD bytesRead = 0;
+                while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                    buffer[bytesRead] = 0;
+                    out += buffer;
+                }
+                CloseHandle(hReadPipe);
+                WaitForSingleObject(pi.hProcess, 10000);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+
+                std::istringstream iss(out);
+                std::string titleLine, sizeLine;
+                std::getline(iss, titleLine);
+                std::getline(iss, sizeLine);
+
+                while (!titleLine.empty() && (titleLine.back() == '\r' || titleLine.back() == '\n' || titleLine.back() == ' ')) titleLine.pop_back();
+                while (!titleLine.empty() && (titleLine.front() == ' ')) titleLine.erase(titleLine.begin());
+                while (!sizeLine.empty() && (sizeLine.back() == '\r' || sizeLine.back() == '\n' || sizeLine.back() == ' ')) sizeLine.pop_back();
+
+                if (!titleLine.empty() && titleLine != "NA") {
+                    int len = MultiByteToWideChar(CP_UTF8, 0, titleLine.c_str(), (int)titleLine.length(), NULL, 0);
+                    std::wstring title(len, 0);
+                    MultiByteToWideChar(CP_UTF8, 0, titleLine.c_str(), (int)titleLine.length(), &title[0], len);
+
+                    for (auto& ch : title) {
+                        if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
+                            ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
+                            ch = L' ';
+                        }
+                    }
+                    while (!title.empty() && (title.back() == L' ' || title.back() == L'\t')) title.pop_back();
+                    while (!title.empty() && (title.front() == L' ' || title.front() == L'\t')) title.erase(title.begin());
+                    if (title.length() > 120) title = title.substr(0, 120);
+
+                    if (!title.empty()) {
+                        std::wstring ext = (pTargetItem->quality.find(L"Audio") != std::wstring::npos || pTargetItem->quality.find(L"MP3") != std::wstring::npos) ? L".mp3" : L".mp4";
+                        std::wstring newFilename = title + ext;
+                        std::wstring newSavePath = baseDir + newFilename;
+                        pTargetItem->filename = newFilename;
+                        pTargetItem->savePath = newSavePath;
+                        if (IsWindow(hWnd) && IsWindow(hSave)) {
+                            SetWindowTextW(hSave, newSavePath.c_str());
+                        }
+                    }
+                }
+
+                if (!sizeLine.empty() && sizeLine != "NA") {
+                    try {
+                        uint64_t parsedSize = std::stoull(sizeLine);
+                        if (parsedSize > 0) {
+                            pTargetItem->sizeBytes = parsedSize;
+                            if (IsWindow(hWnd) && IsWindow(hSize)) {
+                                SetWindowTextW(hSize, FormatFileSizeDisplay(parsedSize).c_str());
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }).detach();
+        }
+
+        // If file size is 0 and it's a direct URL, probe Content-Length in background with WinHTTP
+        if (pState->pItem->sizeBytes == 0 && !DownloadEngine::IsStreamingMediaURL(pState->pItem->url)) {
+            std::wstring url = pState->pItem->url;
+            std::wstring cookies = pState->pItem->cookies;
+            std::wstring referer = pState->pItem->referer;
+            std::wstring userAgent = pState->pItem->userAgent;
+            HWND hSize = pState->hSizeLabel;
+            DownloadItem* pTargetItem = pState->pItem;
+
+            std::thread([url, cookies, referer, userAgent, hSize, pTargetItem, hWnd]() {
+                SegmentedDownloader probe;
+                uint64_t totalSize = 0;
+                bool supportsRange = false;
+                std::wstring fn;
+                probe.m_cookies = cookies;
+                probe.m_referer = referer;
+                probe.m_customUserAgent = userAgent;
+                if (probe.probeUrl(url, totalSize, supportsRange, fn) && totalSize > 0) {
+                    pTargetItem->sizeBytes = totalSize;
+                    if (IsWindow(hWnd) && IsWindow(hSize)) {
+                        std::wstring formatted = FormatFileSizeDisplay(totalSize);
+                        SetWindowTextW(hSize, formatted.c_str());
+                    }
+                }
+            }).detach();
+        }
+
         return 0;
     }
 
@@ -140,6 +324,20 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
                 pState->pItem->savePath = newDir + pState->pItem->filename;
                 SetWindowTextW(pState->hSaveEdit, pState->pItem->savePath.c_str());
                 SetWindowTextW(pState->hPathBox, newDir.c_str());
+
+                // Update category icon immediately
+                if (pState->hCurrentCatIcon) DestroyIcon(pState->hCurrentCatIcon);
+                pState->hCurrentCatIcon = IconFactory::CreateCategoryIcon(44, pState->pItem->category);
+                if (pState->hCurrentCatIcon && pState->hCatIconPic) {
+                    SendMessageW(pState->hCatIconPic, STM_SETICON, (WPARAM)pState->hCurrentCatIcon, 0);
+                }
+            }
+            return 0;
+        }
+
+        if (id == 202) { // "Preview" button
+            if (pState && pState->pItem && !pState->pItem->url.empty()) {
+                ShellExecuteW(hWnd, L"open", pState->pItem->url.c_str(), NULL, NULL, SW_SHOWNORMAL);
             }
             return 0;
         }
@@ -250,8 +448,8 @@ bool ShowDownloadFileInfoDialog(HWND hParent, DownloadItem& item, bool& outStart
         item.savePath = catDir + item.filename;
     }
 
-    int dlgW = 510;
-    int dlgH = 320;
+    int dlgW = 580;
+    int dlgH = 275;
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
     int x = (screenW - dlgW) / 2;

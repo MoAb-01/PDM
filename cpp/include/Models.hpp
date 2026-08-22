@@ -11,6 +11,7 @@ enum class DownloadStatus {
     Queued,
     Connecting,
     Downloading,
+    Merging,
     Paused,
     Complete,
     Error
@@ -78,12 +79,18 @@ struct DownloadItem {
     std::wstring filename;
     std::wstring category; // General, Compressed, Documents, Music, Programs, Video
     std::wstring url;
+    std::wstring originalPageUrl;
+    std::wstring quality;
     std::wstring savePath;
+    std::wstring videoTmpPath;
+    std::wstring audioTmpPath;
     std::wstring referer;
     std::wstring description;
     std::wstring login;
     std::wstring password;
     std::wstring mimeType;
+    std::wstring cookies;
+    std::wstring userAgent;
     std::wstring lastTryDate;
 
     uint64_t sizeBytes = 0;
@@ -92,6 +99,7 @@ struct DownloadItem {
     int connections = 8;
     DownloadStatus status = DownloadStatus::Downloading;
     bool resumeSupported = true;
+    bool needsMux = false;
 
     std::vector<DownloadChunk> chunks;
     std::wstring diagnosticText = L"Active: 0 | Stalled: 0 | Connecting: 0 | Avg Latency: 0 ms";

@@ -18,6 +18,7 @@ add_executable(DownloadManagerAB WIN32
     src/AddUrlDialog.cpp
     src/SchedulerDialog.cpp
     src/DownloadFileInfoDialog.cpp
+    src/DownloadCompleteDialog.cpp
 )
 
 target_link_libraries(DownloadManagerAB PRIVATE

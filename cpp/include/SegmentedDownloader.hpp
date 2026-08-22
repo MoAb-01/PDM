@@ -188,8 +188,6 @@ public:
         );
         if (!hSession) return false;
 
-        DWORD cookiePolicy = WINHTTP_ENABLE_COOKIES;
-        WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_FEATURE, &cookiePolicy, sizeof(cookiePolicy));
         DWORD maxConns = 64;
         WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
         WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
@@ -215,8 +213,61 @@ public:
         DWORD noCache = 1;
         WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &noCache, sizeof(noCache));
 
-        std::wstring rHdr = L"Range: bytes=0-0\r\n";
-        WinHttpAddRequestHeaders(hReq, rHdr.c_str(), (DWORD)rHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        bool isDynamicEndpoint = (url.find(L"overleaf.com") != std::wstring::npos || url.find(L"/download/zip") != std::wstring::npos);
+        if (!isDynamicEndpoint) {
+            std::wstring rHdr = L"Range: bytes=0-0\r\n";
+            WinHttpAddRequestHeaders(hReq, rHdr.c_str(), (DWORD)rHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
+
+        if (!m_cookies.empty()) {
+            std::wstring cookieHdr = L"Cookie: " + m_cookies + L"\r\n";
+            WinHttpAddRequestHeaders(hReq, cookieHdr.c_str(), (DWORD)cookieHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
+        if (!m_referer.empty()) {
+            std::wstring refHdr = L"Referer: " + m_referer + L"\r\n";
+            WinHttpAddRequestHeaders(hReq, refHdr.c_str(), (DWORD)refHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
+        if (!m_customUserAgent.empty()) {
+            std::wstring uaHdr = L"User-Agent: " + m_customUserAgent + L"\r\n";
+            WinHttpAddRequestHeaders(hReq, uaHdr.c_str(), (DWORD)uaHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
+        bool isOverleaf = (url.find(L"overleaf.com") != std::wstring::npos);
+        if (isOverleaf) {
+            std::wstring extraHdr =
+                L"Sec-Fetch-Site: same-origin\r\n"
+                L"Sec-Fetch-Mode: navigate\r\n"
+                L"Sec-Fetch-Dest: document\r\n"
+                L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                L"Accept-Language: en-US,en;q=0.9\r\n";
+            WinHttpAddRequestHeaders(hReq, extraHdr.c_str(), (DWORD)extraHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        } else {
+            std::wstring acceptHdr = L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n";
+            WinHttpAddRequestHeaders(hReq, acceptHdr.c_str(), (DWORD)acceptHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
+
+        {
+            CreateDirectoryW(L"C:\\temp", NULL);
+            std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
+            if (dbg.is_open()) {
+                dbg << L"=== [PROBE REQUEST] ===" << std::endl;
+                dbg << L"URL: " << url << std::endl;
+                dbg << L"Referer: " << m_referer << std::endl;
+                dbg << L"Cookie: " << m_cookies << std::endl;
+                dbg << L"User-Agent: " << m_customUserAgent << std::endl;
+                dbg << L"=======================" << std::endl << std::endl;
+                dbg.close();
+            }
+            std::wofstream dbg2(L"d:\\Download Manager AB\\dm_debug.txt", std::ios::app);
+            if (dbg2.is_open()) {
+                dbg2 << L"=== [PROBE REQUEST] ===" << std::endl;
+                dbg2 << L"URL: " << url << std::endl;
+                dbg2 << L"Referer: " << m_referer << std::endl;
+                dbg2 << L"Cookie: " << m_cookies << std::endl;
+                dbg2 << L"User-Agent: " << m_customUserAgent << std::endl;
+                dbg2 << L"=======================" << std::endl << std::endl;
+                dbg2.close();
+            }
+        }
 
         if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
             WinHttpReceiveResponse(hReq, NULL)) {
@@ -237,7 +288,19 @@ public:
 
             DWORD sc = 0, scSz = sizeof(sc);
             WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scSz, WINHTTP_NO_HEADER_INDEX);
+            m_diagnosticText = L"HTTP Status: " + std::to_wstring(sc);
 
+            {
+                std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
+                if (dbg.is_open()) {
+                    dbg << L"=== [PROBE RESPONSE] ===" << std::endl;
+                    dbg << L"Status Code: " << sc << std::endl;
+                    dbg << L"========================" << std::endl << std::endl;
+                    dbg.close();
+                }
+            }
+
+            outSupportsRange = false;
             if (sc == 206) {
                 outSupportsRange = true;
                 wchar_t cr[256] = { 0 };
@@ -257,7 +320,7 @@ public:
                 wchar_t ar[64] = { 0 };
                 DWORD arSz = sizeof(ar);
                 if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, L"Accept-Ranges", ar, &arSz, WINHTTP_NO_HEADER_INDEX)) {
-                    if (std::wstring(ar).find(L"bytes") != std::wstring::npos) {
+                    if (std::wstring(ar).find(L"bytes") != std::wstring::npos && outSize > 0) {
                         outSupportsRange = true;
                     }
                 }
@@ -279,13 +342,223 @@ public:
         return true;
     }
 
-    bool start(const std::wstring& url, const std::wstring& outputPath, int numSegments = 16, StatsCallback callback = nullptr) {
+    std::wstring m_cookies;
+    std::wstring m_referer;
+    std::wstring m_customUserAgent;
+    std::wstring m_diagnosticText;
+
+    std::thread m_curlThread;
+
+    // Resolve path to bundled tools (curl.exe, yt-dlp.exe) next to exe
+    static std::wstring GetToolsPath() {
+        wchar_t szPath[MAX_PATH] = {};
+        GetModuleFileNameW(NULL, szPath, MAX_PATH);
+        std::wstring exeDir = szPath;
+        size_t slash = exeDir.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) exeDir = exeDir.substr(0, slash);
+        // EXE is in build/Release, tools is at ../../tools
+        std::wstring toolsPath = exeDir + L"\\..\\..\\tools";
+        if (GetFileAttributesW(toolsPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            toolsPath = L"d:\\Download Manager AB\\tools";
+        }
+        return toolsPath;
+    }
+
+    static bool IsYouTubeUrl(const std::wstring& url) {
+        return url.find(L"youtube.com") != std::wstring::npos ||
+               url.find(L"youtu.be") != std::wstring::npos ||
+               url.find(L"googlevideo.com") != std::wstring::npos;
+    }
+
+    void curlWorker(std::wstring url, std::wstring outputPath, std::wstring cookies, std::wstring referer, std::wstring userAgent) {
+        EnsureFolderExistsForFile(outputPath);
+
+        m_running = true;
+        m_completed = false;
+        m_failed = false;
+        m_totalDownloadedBytes.store(0, std::memory_order_relaxed);
+        m_smoothedSpeed = 0.0;
+        m_instantSpeed = 0;
+        m_lastReportedEta = -1;
+        m_diagnosticText = L"LibreSSL / HTTP2 Secure Engine";
+
+        // Setup slot 0 for UI visualizer
+        (*m_liveSlots)[0].active.store(true, std::memory_order_relaxed);
+        (*m_liveSlots)[0].state.store(ChunkState::Receiving, std::memory_order_relaxed);
+        (*m_liveSlots)[0].startByte.store(0, std::memory_order_relaxed);
+
+        std::wstring toolsDir = GetToolsPath();
+        std::wstring cmd;
+
+        if (url.find(L"googlevideo.com") != std::wstring::npos) {
+            // Direct YouTube CDN stream - download with LibreSSL curl
+            std::wstring curlExe = toolsDir + L"\\curl.exe";
+            if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) curlExe = L"curl.exe";
+            m_diagnosticText = L"LibreSSL curl (YouTube CDN)";
+            cmd = L"\"" + curlExe + L"\" -s -L --http2";
+            if (!referer.empty()) cmd += L" -e \"" + referer + L"\"";
+            if (!cookies.empty()) cmd += L" -b \"" + cookies + L"\"";
+            cmd += L" -A \"" + (!userAgent.empty() ? userAgent : std::wstring(USER_AGENT)) + L"\"";
+            cmd += L" -o \"" + outputPath + L"\"";
+            cmd += L" \"" + url + L"\"";
+        } else if (IsYouTubeUrl(url)) {
+            // YouTube watch page - let yt-dlp extract + download natively
+            std::wstring ytDlp = toolsDir + L"\\yt-dlp.exe";
+            if (GetFileAttributesW(ytDlp.c_str()) == INVALID_FILE_ATTRIBUTES) ytDlp = L"yt-dlp.exe";
+            m_diagnosticText = L"yt-dlp Engine (YouTube Native)";
+            cmd = L"\"" + ytDlp + L"\" -f bestvideo+bestaudio/best --merge-output-format mp4";
+            cmd += L" -o \"" + outputPath + L"\"";
+            cmd += L" \"" + url + L"\"";
+        } else {
+            // All other sites: bundled LibreSSL curl (passes Cloudflare)
+            std::wstring curlExe = toolsDir + L"\\curl.exe";
+            if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) curlExe = L"curl.exe";
+            cmd = L"\"" + curlExe + L"\" -s -L --http2";
+            if (!referer.empty()) cmd += L" -e \"" + referer + L"\"";
+            if (!cookies.empty()) cmd += L" -b \"" + cookies + L"\"";
+            cmd += L" -A \"" + (!userAgent.empty() ? userAgent : std::wstring(USER_AGENT)) + L"\"";
+            cmd += L" -o \"" + outputPath + L"\"";
+            cmd += L" \"" + url + L"\"";
+        }
+
+        {
+            CreateDirectoryW(L"C:\\temp", NULL);
+            std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
+            if (dbg.is_open()) {
+                dbg << L"=== [CURL/YTDLP LAUNCH] ===" << std::endl;
+                dbg << L"Command: " << cmd << std::endl;
+                dbg << L"==========================" << std::endl << std::endl;
+                dbg.close();
+            }
+        }
+
+        STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+
+        PROCESS_INFORMATION pi = { 0 };
+        std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+        cmdBuf.push_back(0);
+
+        // Run from tools dir so libcurl-x64.dll and curl-ca-bundle.crt are found
+        std::vector<wchar_t> cwdBuf(toolsDir.begin(), toolsDir.end());
+        cwdBuf.push_back(0);
+
+        BOOL procSuccess = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, cwdBuf.data(), &si, &pi);
+        if (!procSuccess) {
+            m_failed.store(true, std::memory_order_relaxed);
+            m_running.store(false, std::memory_order_relaxed);
+            if (m_callback) m_callback(getStats());
+            return;
+        }
+
+        CloseHandle(pi.hThread);
+
+        uint64_t prevBytes = 0;
+        auto lastTime = std::chrono::steady_clock::now();
+
+        while (m_running) {
+            DWORD waitRes = WaitForSingleObject(pi.hProcess, 100);
+
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            uint64_t currentBytes = 0;
+            if (GetFileAttributesExW(outputPath.c_str(), GetFileExInfoStandard, &fad)) {
+                currentBytes = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            }
+
+            m_totalDownloadedBytes.store(currentBytes, std::memory_order_relaxed);
+            (*m_liveSlots)[0].downloadedBytes.store(currentBytes, std::memory_order_relaxed);
+
+            auto now = std::chrono::steady_clock::now();
+            auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTime).count();
+            if (dtMs > 0) {
+                uint64_t delta = (currentBytes >= prevBytes) ? (currentBytes - prevBytes) : 0;
+                m_instantSpeed = (delta * 1000) / dtMs;
+                m_smoothedSpeed = (m_smoothedSpeed == 0.0) ? (double)m_instantSpeed : (0.25 * (double)m_instantSpeed + 0.75 * m_smoothedSpeed);
+                prevBytes = currentBytes;
+                lastTime = now;
+            }
+
+            if (m_callback) {
+                m_callback(getStats());
+            }
+
+            if (waitRes == WAIT_OBJECT_0) {
+                break;
+            }
+        }
+
+        DWORD exitCode = 0;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        uint64_t finalBytes = 0;
+        if (GetFileAttributesExW(outputPath.c_str(), GetFileExInfoStandard, &fad)) {
+            finalBytes = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        }
+
+        if (exitCode == 0 && finalBytes > 0) {
+            m_totalSize = finalBytes;
+            m_totalDownloadedBytes.store(finalBytes, std::memory_order_relaxed);
+            (*m_liveSlots)[0].downloadedBytes.store(finalBytes, std::memory_order_relaxed);
+            (*m_liveSlots)[0].state.store(ChunkState::Completed, std::memory_order_relaxed);
+            (*m_liveSlots)[0].completed.store(true, std::memory_order_relaxed);
+            (*m_liveSlots)[0].active.store(false, std::memory_order_relaxed);
+            m_completed.store(true, std::memory_order_relaxed);
+            m_running.store(false, std::memory_order_relaxed);
+            if (m_callback) m_callback(getStats());
+            return;
+        }
+
+        m_failed.store(true, std::memory_order_relaxed);
+        m_running.store(false, std::memory_order_relaxed);
+        if (m_callback) m_callback(getStats());
+    }
+
+    bool downloadViaCurl(const std::wstring& url, const std::wstring& outputPath, const std::wstring& cookies, const std::wstring& referer, const std::wstring& userAgent) {
+        if (m_curlThread.joinable()) m_curlThread.join();
+        m_running = true;
+        m_curlThread = std::thread(&SegmentedDownloader::curlWorker, this, url, outputPath, cookies, referer, userAgent);
+        return true;
+    }
+
+    bool start(const std::wstring& url, const std::wstring& outputPath, int numSegments = 16, StatsCallback callback = nullptr, const std::wstring& cookies = L"", const std::wstring& referer = L"", const std::wstring& userAgent = L"") {
         stop();
 
         m_url = url;
         m_outputPath = outputPath;
-        m_numSegments = (numSegments > 0) ? ((numSegments <= MAX_STREAMS) ? numSegments : MAX_STREAMS) : 16;
         m_callback = callback;
+        m_cookies = cookies;
+        m_referer = referer;
+        m_customUserAgent = userAgent;
+
+        // Ensure directory exists
+        EnsureFolderExistsForFile(m_outputPath);
+
+        // Check if there is existing valid partial progress saved to resume seamlessly
+        if (loadPartialMetadata() && m_supportsRange && m_totalSize > 0) {
+            resume();
+            return true;
+        }
+
+        // 1. Probe Server
+        uint64_t totalSize = 0;
+        bool supportsRange = false;
+        std::wstring fn;
+        probeUrl(url, totalSize, supportsRange, fn);
+
+        // Check if site is Overleaf or Cloudflare protected
+        bool isProtectedSite = (url.find(L"overleaf.com") != std::wstring::npos ||
+                                url.find(L"cloudflare") != std::wstring::npos ||
+                                m_diagnosticText.find(L"403") != std::wstring::npos ||
+                                m_diagnosticText.find(L"401") != std::wstring::npos);
+
+        if (isProtectedSite) {
+            return downloadViaCurl(url, outputPath, cookies, referer, userAgent);
+        }
+
+        m_numSegments = (numSegments > 0) ? ((numSegments <= MAX_STREAMS) ? numSegments : MAX_STREAMS) : 16;
         m_running = true;
         m_paused = false;
         m_completed = false;
@@ -299,15 +572,6 @@ public:
         m_samples.clear();
 
         m_pUrl = CrackHttpUrl(url);
-
-        // Ensure directory exists
-        EnsureFolderExistsForFile(m_outputPath);
-
-        // 1. Probe Server
-        uint64_t totalSize = 0;
-        bool supportsRange = false;
-        std::wstring fn;
-        probeUrl(url, totalSize, supportsRange, fn);
 
         m_totalSize = totalSize;
         m_supportsRange = supportsRange;
@@ -325,14 +589,14 @@ public:
             m_numSegments = (numSegments > 0) ? ((numSegments <= MAX_STREAMS) ? numSegments : MAX_STREAMS) : 16;
         }
 
-        // 2. Pre-allocate destination file if total size is known
+        // 2. Pre-allocate destination file if total size is known (OPEN_ALWAYS preserves existing data)
         if (m_totalSize > 0) {
             HANDLE hPreFile = CreateFileW(
                 m_outputPath.c_str(),
                 GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 NULL,
-                CREATE_ALWAYS,
+                OPEN_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
                 NULL
             );
@@ -344,24 +608,21 @@ public:
                 CloseHandle(hPreFile);
             }
         } else {
-            // Truncate / create empty file
-            HANDLE hEmpty = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            HANDLE hEmpty = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hEmpty != INVALID_HANDLE_VALUE) CloseHandle(hEmpty);
         }
 
         // 3. Initialize Global Session
         if (m_pUrl.valid) {
+            const wchar_t* pUserAgent = (!m_customUserAgent.empty()) ? m_customUserAgent.c_str() : USER_AGENT;
             m_hSession = WinHttpOpen(
-                USER_AGENT,
+                pUserAgent,
                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                 WINHTTP_NO_PROXY_NAME,
                 WINHTTP_NO_PROXY_BYPASS,
                 0
             );
             if (m_hSession) {
-                DWORD cookiePolicy = WINHTTP_ENABLE_COOKIES;
-                WinHttpSetOption(m_hSession, WINHTTP_OPTION_ENABLE_FEATURE, &cookiePolicy, sizeof(cookiePolicy));
-
                 DWORD maxConns = 64;
                 WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
                 WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
@@ -370,17 +631,26 @@ public:
         }
 
         // 4. Slice Ranges and Initialize Lock-Free Atomic Slots
-        uint64_t chunkSize = (m_supportsRange && m_totalSize > 0) 
+        uint64_t chunkSize = (m_supportsRange && m_totalSize > 0 && m_numSegments > 0) 
             ? ((m_totalSize + m_numSegments - 1) / m_numSegments) 
-            : m_totalSize;
+            : 0;
 
         for (int i = 0; i < MAX_STREAMS; ++i) {
             if (i < m_numSegments) {
-                uint64_t sByte = i * chunkSize;
-                uint64_t eByte = (i == m_numSegments - 1) ? (m_totalSize > 0 ? m_totalSize - 1 : 0) : ((i + 1) * chunkSize - 1);
-                if (m_totalSize > 0 && sByte >= m_totalSize) {
-                    sByte = m_totalSize;
-                    eByte = m_totalSize;
+                uint64_t sByte = 0;
+                uint64_t eByte = 0;
+                if (m_supportsRange && m_totalSize > 0 && chunkSize > 0) {
+                    sByte = i * chunkSize;
+                    if (i == m_numSegments - 1) {
+                        eByte = m_totalSize - 1;
+                    } else {
+                        eByte = (i + 1) * chunkSize - 1;
+                        if (eByte >= m_totalSize) eByte = m_totalSize - 1;
+                    }
+                    if (sByte >= m_totalSize) {
+                        sByte = m_totalSize;
+                        eByte = m_totalSize;
+                    }
                 }
 
                 (*m_liveSlots)[i].startByte.store(sByte, std::memory_order_relaxed);
@@ -412,6 +682,9 @@ public:
 
     void stop() {
         m_running = false;
+        if (m_curlThread.joinable()) {
+            m_curlThread.join();
+        }
         for (auto& t : m_threads) {
             if (t.joinable()) t.join();
         }
@@ -452,8 +725,6 @@ public:
                 0
             );
             if (m_hSession) {
-                DWORD cookiePolicy = WINHTTP_ENABLE_COOKIES;
-                WinHttpSetOption(m_hSession, WINHTTP_OPTION_ENABLE_FEATURE, &cookiePolicy, sizeof(cookiePolicy));
                 DWORD maxConns = 64;
                 WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
                 WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
@@ -471,8 +742,14 @@ public:
         m_monitorThread = std::thread(&SegmentedDownloader::monitorWorker, this);
     }
 
-    void cancel() {
+    void cancel(bool deleteFiles = true) {
         stop();
+        if (deleteFiles) {
+            deletePartialMetadata();
+            if (!m_outputPath.empty()) {
+                DeleteFileW(m_outputPath.c_str());
+            }
+        }
     }
 
     bool isRunning() const {
@@ -482,6 +759,9 @@ public:
     bool isComplete() const {
         return m_completed.load(std::memory_order_relaxed);
     }
+
+    uint64_t getTotalSize() const { return m_totalSize; }
+    uint64_t getDownloadedBytes() const { return m_totalDownloadedBytes.load(std::memory_order_relaxed); }
 
     std::shared_ptr<std::array<LiveStreamSlot, 16>> getLiveSlots() {
         return m_liveSlots;
@@ -523,8 +803,12 @@ public:
 
         uint32_t avgLat = (latencySamples > 0) ? (uint32_t)(totalLatency / latencySamples) : 18;
         std::wstringstream ssDiag;
-        ssDiag << L"Active: " << activeCount << L" | Stalled: " << stalledCount
-               << L" | Connecting: " << connectingCount << L" | Avg Latency: " << avgLat << L" ms";
+        if (!m_diagnosticText.empty()) {
+            ssDiag << m_diagnosticText;
+        } else {
+            ssDiag << L"Active: " << activeCount << L" | Stalled: " << stalledCount
+                   << L" | Connecting: " << connectingCount << L" | Avg Latency: " << avgLat << L" ms";
+        }
         stats.diagnosticText = ssDiag.str();
 
         if (m_totalSize > 0) {
@@ -637,11 +921,70 @@ private:
                 WinHttpAddRequestHeaders(hReq, range.c_str(), (DWORD)range.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
             }
 
+            if (!m_cookies.empty()) {
+                std::wstring cookieHdr = L"Cookie: " + m_cookies + L"\r\n";
+                WinHttpAddRequestHeaders(hReq, cookieHdr.c_str(), (DWORD)cookieHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+            if (!m_referer.empty()) {
+                std::wstring refHdr = L"Referer: " + m_referer + L"\r\n";
+                WinHttpAddRequestHeaders(hReq, refHdr.c_str(), (DWORD)refHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+            if (!m_customUserAgent.empty()) {
+                std::wstring uaHdr = L"User-Agent: " + m_customUserAgent + L"\r\n";
+                WinHttpAddRequestHeaders(hReq, uaHdr.c_str(), (DWORD)uaHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+            bool isOverleaf = (m_url.find(L"overleaf.com") != std::wstring::npos);
+            if (isOverleaf) {
+                std::wstring extraHdr =
+                    L"Sec-Fetch-Site: same-origin\r\n"
+                    L"Sec-Fetch-Mode: navigate\r\n"
+                    L"Sec-Fetch-Dest: document\r\n"
+                    L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                    L"Accept-Language: en-US,en;q=0.9\r\n";
+                WinHttpAddRequestHeaders(hReq, extraHdr.c_str(), (DWORD)extraHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            } else {
+                std::wstring acceptHdr = L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n";
+                WinHttpAddRequestHeaders(hReq, acceptHdr.c_str(), (DWORD)acceptHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+
             DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
             WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
 
             DWORD disableCache = 1;
             WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
+
+            // Debug log to C:\temp\dm_debug.txt and d:\Download Manager AB\dm_debug.txt right before WinHttpSendRequest
+            {
+                CreateDirectoryW(L"C:\\temp", NULL);
+                std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
+                if (dbg.is_open()) {
+                    dbg << L"=== [WORKER DOWNLOAD REQUEST] ===" << std::endl;
+                    dbg << L"URL: " << m_url << std::endl;
+                    dbg << L"Slot ID: " << id << std::endl;
+                    dbg << L"Referer: " << m_referer << std::endl;
+                    dbg << L"Cookie: " << m_cookies << std::endl;
+                    dbg << L"User-Agent: " << m_customUserAgent << std::endl;
+                    dbg << L"SupportsRange: " << (m_supportsRange ? L"true" : L"false") << std::endl;
+                    dbg << L"TotalSize: " << m_totalSize << std::endl;
+                    dbg << L"Start: " << start << L", End: " << end << std::endl;
+                    dbg << L"=================================" << std::endl << std::endl;
+                    dbg.close();
+                }
+                std::wofstream dbg2(L"d:\\Download Manager AB\\dm_debug.txt", std::ios::app);
+                if (dbg2.is_open()) {
+                    dbg2 << L"=== [WORKER DOWNLOAD REQUEST] ===" << std::endl;
+                    dbg2 << L"URL: " << m_url << std::endl;
+                    dbg2 << L"Slot ID: " << id << std::endl;
+                    dbg2 << L"Referer: " << m_referer << std::endl;
+                    dbg2 << L"Cookie: " << m_cookies << std::endl;
+                    dbg2 << L"User-Agent: " << m_customUserAgent << std::endl;
+                    dbg2 << L"SupportsRange: " << (m_supportsRange ? L"true" : L"false") << std::endl;
+                    dbg2 << L"TotalSize: " << m_totalSize << std::endl;
+                    dbg2 << L"Start: " << start << L", End: " << end << std::endl;
+                    dbg2 << L"=================================" << std::endl << std::endl;
+                    dbg2.close();
+                }
+            }
 
             auto t0 = std::chrono::steady_clock::now();
             if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
@@ -654,9 +997,35 @@ private:
             DWORD statusCode = 0;
             DWORD statusSize = sizeof(statusCode);
             WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+            m_diagnosticText = L"HTTP Status: " + std::to_wstring(statusCode);
+
+            {
+                std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
+                if (dbg.is_open()) {
+                    dbg << L"=== [WORKER RESPONSE RECEIVED] ===" << std::endl;
+                    dbg << L"Slot ID: " << id << std::endl;
+                    dbg << L"Status Code: " << statusCode << std::endl;
+                    DWORD rawHdrSz = 0;
+                    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &rawHdrSz, WINHTTP_NO_HEADER_INDEX);
+                    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && rawHdrSz > 0) {
+                        std::vector<wchar_t> rawHdrs(rawHdrSz / sizeof(wchar_t) + 1);
+                        if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, rawHdrs.data(), &rawHdrSz, WINHTTP_NO_HEADER_INDEX)) {
+                            dbg << L"Response Headers:\n" << rawHdrs.data() << std::endl;
+                        }
+                    }
+                    dbg << L"==================================" << std::endl << std::endl;
+                    dbg.close();
+                }
+            }
             if (statusCode != 200 && statusCode != 206) {
                 WinHttpCloseHandle(hReq);
                 WinHttpCloseHandle(hConnect);
+                if (statusCode == 401 || statusCode == 403 || statusCode == 404 || statusCode >= 400) {
+                    m_failed = true;
+                    m_running = false;
+                    (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
+                    return;
+                }
                 continue;
             }
 
@@ -684,6 +1053,8 @@ private:
             (*m_liveSlots)[id].state.store(ChunkState::Receiving, std::memory_order_relaxed);
 
             while (m_running && WinHttpReadData(hReq, buf.data(), BUF_SIZE, &bytesRead) && bytesRead > 0) {
+                (*m_liveSlots)[id].state.store(ChunkState::Receiving, std::memory_order_relaxed);
+
                 if (hLocalFile != INVALID_HANDLE_VALUE) {
                     OVERLAPPED ov = { 0 };
                     ov.Offset = (DWORD)(currentOffset & 0xFFFFFFFF);
@@ -699,17 +1070,37 @@ private:
             }
 
             if (hLocalFile != INVALID_HANDLE_VALUE) {
+                // If single-connection streaming mode, truncate file to exact byte count
+                if (!m_supportsRange || m_totalSize == 0) {
+                    LARGE_INTEGER li;
+                    li.QuadPart = (LONGLONG)currentOffset;
+                    SetFilePointerEx(hLocalFile, li, NULL, FILE_BEGIN);
+                    SetEndOfFile(hLocalFile);
+                }
                 CloseHandle(hLocalFile);
             }
 
             WinHttpCloseHandle(hReq);
             WinHttpCloseHandle(hConnect);
 
-            bool complete = (end > 0) ? (currentOffset > end) : (currentOffset > 0);
+            bool complete = false;
+            if (m_supportsRange && m_totalSize > 0 && end > 0) {
+                complete = (currentOffset > end);
+            } else {
+                // Single connection streaming until EOF
+                complete = (currentOffset > 0);
+                if (complete && (m_totalSize == 0 || m_totalSize != currentOffset)) {
+                    m_totalSize = currentOffset;
+                }
+            }
+
             if (complete) {
                 (*m_liveSlots)[id].state.store(ChunkState::Completed, std::memory_order_relaxed);
                 (*m_liveSlots)[id].completed.store(true, std::memory_order_relaxed);
                 (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
+                if (m_numSegments == 1) {
+                    m_completed.store(true, std::memory_order_relaxed);
+                }
                 return;
             }
         }
@@ -771,7 +1162,14 @@ private:
                 m_callback(getStats());
             }
 
-            if (allComplete && (m_totalSize == 0 || totalDownloaded >= m_totalSize)) {
+            if (m_failed.load(std::memory_order_relaxed) || (anyFailed && totalDownloaded == 0)) {
+                m_running.store(false, std::memory_order_relaxed);
+                m_completed.store(false, std::memory_order_relaxed);
+                if (m_callback) m_callback(getStats());
+                break;
+            }
+
+            if (!anyFailed && !m_failed.load(std::memory_order_relaxed) && allComplete && totalDownloaded > 0 && (m_totalSize == 0 || totalDownloaded >= m_totalSize)) {
                 m_completed.store(true, std::memory_order_relaxed);
                 m_running.store(false, std::memory_order_relaxed);
                 deletePartialMetadata();

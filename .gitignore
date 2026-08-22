@@ -17,6 +17,12 @@ dist/
 # Temporary and partial download files
 *.partial
 *.tmp
+*.bin
+dm_debug.txt
+tools/curl-extracted/
+tools/curl-win64.zip
+tools/ffmpeg.exe
+tools/yt-dlp.exe
 
 # Environment and editor files
 .vscode/

@@ -222,15 +222,86 @@ void DownloadEngine::UpdateItem(const DownloadItem& item) {
     SaveHistory();
 }
 
+void DownloadEngine::CleanupDownloadDiskFiles(const DownloadItem& item, bool deleteIncompleteTarget) {
+    if (!item.videoTmpPath.empty()) {
+        DeleteFileW(item.videoTmpPath.c_str());
+    }
+    if (!item.audioTmpPath.empty()) {
+        DeleteFileW(item.audioTmpPath.c_str());
+    }
+    if (!item.savePath.empty()) {
+        std::wstring videoTmp = item.savePath + L".video_" + item.id + L".tmp";
+        std::wstring audioTmp = item.savePath + L".audio_" + item.id + L".tmp";
+        DeleteFileW(videoTmp.c_str());
+        DeleteFileW(audioTmp.c_str());
+
+        std::wstring metaPath = item.savePath + L".partial";
+        DeleteFileW(metaPath.c_str());
+
+        if (deleteIncompleteTarget && item.status != DownloadStatus::Complete) {
+            if (PathFileExistsW(item.savePath.c_str()) && (item.sizeBytes == 0 || item.downloadedBytes < item.sizeBytes)) {
+                DeleteFileW(item.savePath.c_str());
+            }
+        }
+    }
+}
+
+void DownloadEngine::CancelDownload(const std::wstring& id, bool deleteFiles) {
+    DownloadItem itemToClean;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lockDownloader(m_downloaderMutex);
+        auto it = m_activeDownloaders.find(id);
+        if (it != m_activeDownloaders.end() && it->second) {
+            it->second->cancel(deleteFiles);
+            m_activeDownloaders.erase(it);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& d : m_downloads) {
+            if (d.id == id) {
+                d.status = DownloadStatus::Error;
+                d.speedBytesPerSec = 0;
+                d.diagnosticText = L"Download cancelled by user. Temporary files cleaned up.";
+                for (auto& c : d.chunks) c.active = false;
+                itemToClean = d;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (found && deleteFiles) {
+        CleanupDownloadDiskFiles(itemToClean, true);
+    }
+    if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
+    SaveHistory();
+}
+
 void DownloadEngine::DeleteItem(const std::wstring& id) {
+    DownloadItem itemToClean;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lockDownloader(m_downloaderMutex);
+        auto it = m_activeDownloaders.find(id);
+        if (it != m_activeDownloaders.end() && it->second) {
+            it->second->cancel(true);
+            m_activeDownloaders.erase(it);
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto it = m_downloads.begin(); it != m_downloads.end(); ++it) {
             if (it->id == id) {
+                itemToClean = *it;
+                found = true;
                 m_downloads.erase(it);
                 break;
             }
         }
+    }
+    if (found) {
+        CleanupDownloadDiskFiles(itemToClean, itemToClean.status != DownloadStatus::Complete);
     }
     SaveHistory();
 }
@@ -330,6 +401,235 @@ std::shared_ptr<SegmentedDownloader> DownloadEngine::GetActiveDownloader(const s
     return nullptr;
 }
 
+bool DownloadEngine::IsStreamingMediaURL(const std::wstring& url) {
+    if (url.empty()) return false;
+
+    // Check all popular streaming / social video platforms
+    if (url.find(L"youtube.com") != std::wstring::npos ||
+        url.find(L"youtu.be") != std::wstring::npos ||
+        url.find(L"facebook.com") != std::wstring::npos ||
+        url.find(L"fb.watch") != std::wstring::npos ||
+        url.find(L"fb.com") != std::wstring::npos ||
+        url.find(L"instagram.com") != std::wstring::npos ||
+        url.find(L"tiktok.com") != std::wstring::npos ||
+        url.find(L"twitter.com") != std::wstring::npos ||
+        url.find(L"x.com/") != std::wstring::npos ||
+        url.find(L"reddit.com") != std::wstring::npos ||
+        url.find(L"v.redd.it") != std::wstring::npos ||
+        url.find(L"vimeo.com") != std::wstring::npos ||
+        url.find(L"dailymotion.com") != std::wstring::npos ||
+        url.find(L"twitch.tv") != std::wstring::npos ||
+        url.find(L"bilibili.com") != std::wstring::npos ||
+        url.find(L"threads.net") != std::wstring::npos ||
+        url.find(L"pinterest.com") != std::wstring::npos ||
+        url.find(L"soundcloud.com") != std::wstring::npos) {
+        return true;
+    }
+
+    // Check if URL looks like a streaming video webpage without a binary file extension
+    size_t q = url.find(L'?');
+    std::wstring pathOnly = (q != std::wstring::npos) ? url.substr(0, q) : url;
+    size_t dot = pathOnly.find_last_of(L'.');
+    size_t slash = pathOnly.find_last_of(L'/');
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)) {
+        if (url.find(L"/reel") != std::wstring::npos ||
+            url.find(L"/watch") != std::wstring::npos ||
+            url.find(L"/video") != std::wstring::npos ||
+            url.find(L"/shorts") != std::wstring::npos ||
+            url.find(L"/status/") != std::wstring::npos ||
+            url.find(L"/p/") != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DownloadEngine::IsYouTubeURL(const std::wstring& url) {
+    return IsStreamingMediaURL(url);
+}
+
+std::wstring DownloadEngine::FindFFmpegPath() {
+    wchar_t szPath[MAX_PATH] = { 0 };
+    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+    PathRemoveFileSpecW(szPath);
+
+    std::wstring localTools = std::wstring(szPath) + L"\\..\\..\\tools\\ffmpeg.exe";
+    if (PathFileExistsW(localTools.c_str())) return localTools;
+
+    std::wstring localSame = std::wstring(szPath) + L"\\ffmpeg.exe";
+    if (PathFileExistsW(localSame.c_str())) return localSame;
+
+    if (PathFileExistsW(L"d:\\Download Manager AB\\tools\\ffmpeg.exe")) return L"d:\\Download Manager AB\\tools\\ffmpeg.exe";
+    if (PathFileExistsW(L"C:\\ffmpeg\\bin\\ffmpeg.exe")) return L"C:\\ffmpeg\\bin\\ffmpeg.exe";
+    if (PathFileExistsW(L"C:\\ffmpeg\\ffmpeg.exe")) return L"C:\\ffmpeg\\ffmpeg.exe";
+
+    return L"ffmpeg.exe"; // Fallback to system PATH
+}
+
+YouTubeStreams DownloadEngine::ExtractYouTubeStreams(const std::wstring& pageUrl, const std::wstring& quality) {
+    YouTubeStreams res;
+
+    wchar_t szPath[MAX_PATH] = { 0 };
+    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+    PathRemoveFileSpecW(szPath);
+
+    std::wstring ytDlp = std::wstring(szPath) + L"\\..\\..\\tools\\yt-dlp.exe";
+    if (!PathFileExistsW(ytDlp.c_str())) {
+        ytDlp = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
+    }
+
+    // Prioritize universal H.264 (AVC) video and AAC audio so videos play natively in Windows Media Player without requiring extra AV1 codecs
+    std::wstring fmt;
+    if (quality.find(L"Audio") != std::wstring::npos || quality.find(L"MP3") != std::wstring::npos) {
+        fmt = L"bestaudio[acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec^=aac]/bestaudio/best";
+    } else if (quality.find(L"1080") != std::wstring::npos) {
+        fmt = L"bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc][height<=1080]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc][height<=1080]+bestaudio/"
+              L"best[vcodec^=avc1][height<=1080]/"
+              L"best[vcodec^=avc][height<=1080]/"
+              L"best[vcodec^=h264][height<=1080]/"
+              L"best[ext=mp4][height<=1080][vcodec!=av01][vcodec!=vp09]/"
+              L"bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+              L"best[height<=1080][ext=mp4]/"
+              L"bestvideo[height<=1080]+bestaudio/"
+              L"best[height<=1080]/best";
+    } else if (quality.find(L"720") != std::wstring::npos) {
+        fmt = L"bestvideo[vcodec^=avc1][height<=720]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc][height<=720]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc][height<=720]+bestaudio/"
+              L"best[vcodec^=avc1][height<=720]/"
+              L"best[vcodec^=avc][height<=720]/"
+              L"best[vcodec^=h264][height<=720]/"
+              L"best[ext=mp4][height<=720][vcodec!=av01][vcodec!=vp09]/"
+              L"bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+              L"best[height<=720][ext=mp4]/"
+              L"bestvideo[height<=720]+bestaudio/"
+              L"best[height<=720]/best";
+    } else if (quality.find(L"480") != std::wstring::npos) {
+        fmt = L"bestvideo[vcodec^=avc1][height<=480]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc][height<=480]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc][height<=480]+bestaudio/"
+              L"best[vcodec^=avc1][height<=480]/"
+              L"best[vcodec^=avc][height<=480]/"
+              L"best[vcodec^=h264][height<=480]/"
+              L"best[ext=mp4][height<=480][vcodec!=av01][vcodec!=vp09]/"
+              L"bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+              L"best[height<=480][ext=mp4]/"
+              L"bestvideo[height<=480]+bestaudio/"
+              L"best[height<=480]/best";
+    } else {
+        fmt = L"bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+              L"bestvideo[vcodec^=avc]+bestaudio/"
+              L"best[vcodec^=avc1]/"
+              L"best[vcodec^=avc]/"
+              L"best[vcodec^=h264]/"
+              L"best[ext=mp4][vcodec!=av01][vcodec!=vp09]/"
+              L"bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+              L"best[ext=mp4]/"
+              L"bestvideo+bestaudio/"
+              L"best";
+    }
+
+    std::wstring cmd = L"\"" + ytDlp + L"\" --no-playlist --no-warnings --print \"%(title)s\" --get-url -f \"" + fmt + L"\" \"" + pageUrl + L"\"";
+
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    HANDLE hReadPipe, hWritePipe;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return res;
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = { 0 };
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+
+    BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+    CloseHandle(hWritePipe);
+
+    if (!success) {
+        CloseHandle(hReadPipe);
+        return res;
+    }
+
+    std::string out;
+    char buffer[1024];
+    DWORD bytesRead = 0;
+    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = 0;
+        out += buffer;
+    }
+    CloseHandle(hReadPipe);
+
+    WaitForSingleObject(pi.hProcess, 15000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    std::vector<std::wstring> rawLines;
+    std::stringstream ss(out);
+    std::string l;
+    while (std::getline(ss, l)) {
+        while (!l.empty() && (l.back() == '\r' || l.back() == '\n' || l.back() == ' ')) l.pop_back();
+        while (!l.empty() && (l.front() == ' ')) l.erase(l.begin());
+        if (!l.empty()) {
+            int len = MultiByteToWideChar(CP_UTF8, 0, l.c_str(), (int)l.length(), NULL, 0);
+            std::wstring wl(len, 0);
+            MultiByteToWideChar(CP_UTF8, 0, l.c_str(), (int)l.length(), &wl[0], len);
+            rawLines.push_back(wl);
+        }
+    }
+
+    std::vector<std::wstring> urlLines;
+    for (const auto& line : rawLines) {
+        if (line.rfind(L"http://", 0) == 0 || line.rfind(L"https://", 0) == 0) {
+            urlLines.push_back(line);
+        } else if (res.title.empty()) {
+            res.title = line;
+        }
+    }
+
+    if (urlLines.size() >= 2) {
+        res.videoUrl = urlLines[0];
+        res.audioUrl = urlLines[1];
+        res.needsMux = true;
+    } else if (urlLines.size() == 1) {
+        res.videoUrl = urlLines[0];
+        res.needsMux = false;
+    }
+
+    return res;
+}
+
+bool DownloadEngine::MuxVideoAudio(const std::wstring& videoPath, const std::wstring& audioPath, const std::wstring& outputPath) {
+    std::wstring ffmpeg = FindFFmpegPath();
+
+    std::wstring cmd = L"\"" + ffmpeg + L"\" -y -i \"" + videoPath + L"\" -i \"" + audioPath + L"\" -c copy -movflags +faststart \"" + outputPath + L"\"";
+
+    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = { 0 };
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+
+    BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+    if (!success) return false;
+
+    WaitForSingleObject(pi.hProcess, 30000);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return (exitCode == 0);
+}
+
 void DownloadEngine::DownloadWorker(std::wstring id) {
     DownloadItem item;
     {
@@ -344,185 +644,230 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
 
     if (item.url.empty()) return;
 
-    // Case 1: Web Streaming Video (YouTube, Shorts, TikTok, etc.)
-    if (IsStreamingPlatformUrl(item.url)) {
-        std::wstring toolExe = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
-        std::wstring ffmpegExe = L"C:\\ffmpeg\\ffmpeg.exe";
+    // Streaming Media Resolution & Dual-Stream 16-Thread Download (YouTube, Facebook, TikTok, Instagram, Twitter, etc.)
+    if (IsStreamingMediaURL(item.url)) {
+        item.originalPageUrl = item.url;
+        YouTubeStreams streams = ExtractYouTubeStreams(item.url, item.quality);
 
-        // IDM 16-Thread Acceleration + Universal H.264 (AVC) + AAC encoding for 100% Windows Media Player compatibility
-        std::wstring cmd = L"\"" + toolExe + L"\" --newline --progress-template \"download:[idm_p] %(progress._percent_str)s | %(progress._total_bytes_str)s | %(progress._speed_str)s | %(progress._eta_str)s\" --no-playlist -N 16 --concurrent-fragments 16 --buffer-size 16M -S \"res,vcodec:h264,acodec:m4a\" --merge-output-format mp4 --ffmpeg-location \"" + ffmpegExe + L"\" -o \"" + item.savePath + L"\" \"" + item.url + L"\"";
-
-        SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
-        HANDLE hReadPipe, hWritePipe;
-        if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
-        SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
-
-        STARTUPINFOW si = { sizeof(STARTUPINFOW) };
-        si.dwFlags |= STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        si.hStdOutput = hWritePipe;
-        si.hStdError = hWritePipe;
-        si.wShowWindow = SW_HIDE;
-
-        PROCESS_INFORMATION pi = { 0 };
-        std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
-        cmdBuf.push_back(0);
-
-        BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-        CloseHandle(hWritePipe);
-
-        if (success) {
-            std::shared_ptr<std::array<LiveStreamSlot, 16>> pSlots = nullptr;
+        if (streams.videoUrl.empty()) {
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 for (auto& d : m_downloads) {
                     if (d.id == id) {
-                        pSlots = d.liveSlots;
+                        d.status = DownloadStatus::Error;
+                        d.diagnosticText = L"Failed to extract video stream from URL. Please check the link.";
                         break;
                     }
                 }
             }
-
-            char buffer[512];
-            DWORD bytesRead;
-            std::string lineAcc;
-
-            // Pattern for custom unbuffered template: "download:[idm_p] 24.5% | 35.20MiB | 6.42MiB/s | 00:03"
-            std::regex reTemplate(R"(\[idm_p\]\s+(\d+(?:\.\d+)?)%\s+\|\s+(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s+\|\s+(\d+(?:\.\d+)?)\s*([A-Za-z]+)/s(?:\s+\|\s+(\d+:\d+(?::\d+)?))?)");
-            // Standard fallback regex
-            std::regex reStandard(R"(\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s+at\s+(\d+(?:\.\d+)?)\s*([A-Za-z]+)/s)");
-
-            double smoothedSpeed = 0.0;
-
-            while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-                buffer[bytesRead] = '\0';
-                lineAcc += buffer;
-
-                size_t pos;
-                while ((pos = lineAcc.find_first_of("\r\n")) != std::string::npos) {
-                    std::string line = lineAcc.substr(0, pos);
-                    lineAcc.erase(0, pos + 1);
-
-                    double pct = 0;
-                    double totalVal = 0, speedVal = 0;
-                    std::string totalUnit = "MiB", speedUnit = "MiB";
-                    bool matched = false;
-
-                    std::smatch match;
-                    if (std::regex_search(line, match, reTemplate)) {
-                        pct = std::stod(match[1].str());
-                        totalVal = std::stod(match[2].str());
-                        totalUnit = match[3].str();
-                        speedVal = std::stod(match[4].str());
-                        speedUnit = match[5].str();
-                        matched = true;
-                    } else if (std::regex_search(line, match, reStandard)) {
-                        pct = std::stod(match[1].str());
-                        totalVal = std::stod(match[2].str());
-                        totalUnit = match[3].str();
-                        speedVal = std::stod(match[4].str());
-                        speedUnit = match[5].str();
-                        matched = true;
-                    }
-
-                    if (matched && totalVal > 0) {
-                        uint64_t realTotal = ParseSizeToBytes(totalVal, totalUnit);
-                        uint64_t instantSpeed = ParseSizeToBytes(speedVal, speedUnit);
-
-                        // Exponential Smoothing: smoothed = 0.2 * instant + 0.8 * smoothed
-                        if (smoothedSpeed == 0.0) smoothedSpeed = (double)instantSpeed;
-                        else smoothedSpeed = 0.2 * (double)instantSpeed + 0.8 * smoothedSpeed;
-
-                        uint64_t realDownloaded = (uint64_t)((pct / 100.0) * (double)realTotal);
-
-                        // Lock-free sequential slot distribution
-                        if (pSlots) {
-                            uint64_t segSize = (realTotal > 0) ? (realTotal / 16) : 0;
-                            uint64_t remainingBytes = realDownloaded;
-                            for (size_t i = 0; i < 16; ++i) {
-                                uint64_t startB = i * segSize;
-                                uint64_t endB = (i == 15) ? realTotal : ((i + 1) * segSize - 1);
-                                uint64_t chunkCapacity = (endB > startB) ? (endB - startB + 1) : 1;
-
-                                (*pSlots)[i].startByte.store(startB, std::memory_order_relaxed);
-                                (*pSlots)[i].endByte.store(endB, std::memory_order_relaxed);
-                                (*pSlots)[i].latencyMs.store(18, std::memory_order_relaxed);
-
-                                if (remainingBytes >= chunkCapacity) {
-                                    (*pSlots)[i].downloadedBytes.store(chunkCapacity, std::memory_order_relaxed);
-                                    (*pSlots)[i].completed.store(true, std::memory_order_relaxed);
-                                    (*pSlots)[i].active.store(false, std::memory_order_relaxed);
-                                    (*pSlots)[i].state.store(ChunkState::Completed, std::memory_order_relaxed);
-                                    remainingBytes -= chunkCapacity;
-                                } else if (remainingBytes > 0) {
-                                    (*pSlots)[i].downloadedBytes.store(remainingBytes, std::memory_order_relaxed);
-                                    (*pSlots)[i].completed.store(false, std::memory_order_relaxed);
-                                    (*pSlots)[i].active.store(true, std::memory_order_relaxed);
-                                    (*pSlots)[i].state.store(ChunkState::Receiving, std::memory_order_relaxed);
-                                    remainingBytes = 0;
-                                } else {
-                                    (*pSlots)[i].downloadedBytes.store(0, std::memory_order_relaxed);
-                                    (*pSlots)[i].completed.store(false, std::memory_order_relaxed);
-                                    (*pSlots)[i].active.store(false, std::memory_order_relaxed);
-                                    (*pSlots)[i].state.store(ChunkState::Idle, std::memory_order_relaxed);
-                                }
-                            }
-                        }
-
-                        {
-                            std::lock_guard<std::mutex> lock(m_mutex);
-                            for (auto& d : m_downloads) {
-                                if (d.id == id) {
-                                    d.downloadedBytes = realDownloaded;
-                                    d.sizeBytes = realTotal;
-                                    d.speedBytesPerSec = (uint64_t)smoothedSpeed;
-                                    wchar_t diagBuf[128];
-                                    swprintf_s(diagBuf, L"Active: 16 | Stalled: 0 | Connecting: 0 | Avg Latency: 18 ms");
-                                    d.diagnosticText = diagBuf;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (m_onProgress) {
-                            m_onProgress(id, realDownloaded, realTotal, (uint64_t)smoothedSpeed);
-                        }
-                    }
-                }
-            }
-
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            CloseHandle(hReadPipe);
-
-            // Get exact final file size from disk
-            WIN32_FILE_ATTRIBUTE_DATA fad;
-            uint64_t finalSize = 0;
-            if (GetFileAttributesExW(item.savePath.c_str(), GetFileExInfoStandard, &fad)) {
-                finalSize = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-            }
-
-            // Mark completed
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                for (auto& d : m_downloads) {
-                    if (d.id == id) {
-                        d.status = DownloadStatus::Complete;
-                        d.downloadedBytes = (finalSize > 0) ? finalSize : d.sizeBytes;
-                        d.sizeBytes = (finalSize > 0) ? finalSize : d.sizeBytes;
-                        d.speedBytesPerSec = 0;
-                        for (auto& c : d.chunks) { c.completed = true; c.active = false; }
-                        break;
-                    }
-                }
-            }
-            SaveHistory();
-            if (m_onStatus) m_onStatus(id, DownloadStatus::Complete);
+            if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
             return;
+        }
+
+        // Apply extracted video title automatically if available
+        if (!streams.title.empty()) {
+            std::wstring cleanTitle = streams.title;
+            for (auto& ch : cleanTitle) {
+                if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
+                    ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
+                    ch = L' ';
+                }
+            }
+            while (!cleanTitle.empty() && (cleanTitle.back() == L' ' || cleanTitle.back() == L'\t')) cleanTitle.pop_back();
+            while (!cleanTitle.empty() && (cleanTitle.front() == L' ' || cleanTitle.front() == L'\t')) cleanTitle.erase(cleanTitle.begin());
+            if (cleanTitle.length() > 120) cleanTitle = cleanTitle.substr(0, 120);
+
+            if (!cleanTitle.empty()) {
+                std::wstring ext = (item.quality.find(L"Audio") != std::wstring::npos || item.quality.find(L"MP3") != std::wstring::npos) ? L".mp3" : L".mp4";
+                item.filename = cleanTitle + ext;
+
+                wchar_t szDir[MAX_PATH] = { 0 };
+                wcsncpy_s(szDir, item.savePath.c_str(), MAX_PATH - 1);
+                PathRemoveFileSpecW(szDir);
+                if (wcslen(szDir) > 0) {
+                    item.savePath = std::wstring(szDir) + L"\\" + item.filename;
+                } else {
+                    item.savePath = L"C:\\Users\\UHD\\Downloads\\Video\\" + item.filename;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    for (auto& d : m_downloads) {
+                        if (d.id == id) {
+                            d.filename = item.filename;
+                            d.savePath = item.savePath;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ensure proper filename and savePath extension (.mp4 or .mp3)
+        std::wstring targetExt = (item.quality.find(L"Audio") != std::wstring::npos || item.quality.find(L"MP3") != std::wstring::npos) ? L".mp3" : L".mp4";
+        if (item.savePath.find(L".mp4") == std::wstring::npos && item.savePath.find(L".mp3") == std::wstring::npos) {
+            item.savePath += targetExt;
+            item.filename += targetExt;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (auto& d : m_downloads) {
+                    if (d.id == id) {
+                        d.savePath = item.savePath;
+                        d.filename = item.filename;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (streams.needsMux && !streams.audioUrl.empty()) {
+            std::wstring videoTmp = item.savePath + L".video_" + item.id + L".tmp";
+            std::wstring audioTmp = item.savePath + L".audio_" + item.id + L".tmp";
+
+            auto pVideoDownloader = std::make_shared<SegmentedDownloader>();
+            auto pAudioDownloader = std::make_shared<SegmentedDownloader>();
+
+            {
+                std::lock_guard<std::mutex> lock(m_downloaderMutex);
+                m_activeDownloaders[id] = pVideoDownloader;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (auto& d : m_downloads) {
+                    if (d.id == id) {
+                        d.liveSlots = pVideoDownloader->getLiveSlots();
+                        d.videoTmpPath = videoTmp;
+                        d.audioTmpPath = audioTmp;
+                        d.needsMux = true;
+                        break;
+                    }
+                }
+            }
+
+            std::atomic<bool> videoComplete{ false };
+            std::atomic<bool> audioComplete{ false };
+            std::atomic<bool> videoFailed{ false };
+            std::atomic<bool> audioFailed{ false };
+
+            pVideoDownloader->start(streams.videoUrl, videoTmp, 12, [this, id, pAudioDownloader, &videoComplete, &videoFailed](const DownloadStats& vStats) {
+                if (vStats.isComplete) videoComplete.store(true, std::memory_order_relaxed);
+                if (vStats.isFailed) videoFailed.store(true, std::memory_order_relaxed);
+
+                uint64_t aDown = pAudioDownloader->getDownloadedBytes();
+                uint64_t aTot = pAudioDownloader->getTotalSize();
+                uint64_t totalDown = vStats.downloadedBytes + aDown;
+                uint64_t totalSize = (vStats.totalSize > 0 && aTot > 0) ? (vStats.totalSize + aTot) : vStats.totalSize;
+
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    for (auto& d : m_downloads) {
+                        if (d.id == id) {
+                            d.downloadedBytes = totalDown;
+                            d.sizeBytes = totalSize;
+                            d.speedBytesPerSec = vStats.smoothedSpeedBps;
+                            d.diagnosticText = vStats.diagnosticText;
+                            break;
+                        }
+                    }
+                }
+                if (m_onProgress) m_onProgress(id, totalDown, totalSize, (uint64_t)vStats.smoothedSpeedBps);
+            });
+
+            pAudioDownloader->start(streams.audioUrl, audioTmp, 4, [&audioComplete, &audioFailed](const DownloadStats& aStats) {
+                if (aStats.isComplete) audioComplete.store(true, std::memory_order_relaxed);
+                if (aStats.isFailed) audioFailed.store(true, std::memory_order_relaxed);
+            });
+
+            while (m_running && (!videoComplete.load() || !audioComplete.load()) && !videoFailed.load() && !audioFailed.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            if (videoComplete.load() && audioComplete.load()) {
+                // Transition status to Merging
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    for (auto& d : m_downloads) {
+                        if (d.id == id) {
+                            d.status = DownloadStatus::Merging;
+                            d.diagnosticText = L"Merging Video & Audio Streams (0.5s lossless)...";
+                            break;
+                        }
+                    }
+                }
+                if (m_onStatus) m_onStatus(id, DownloadStatus::Merging);
+
+                bool muxSuccess = MuxVideoAudio(videoTmp, audioTmp, item.savePath);
+                DeleteFileW(videoTmp.c_str());
+                DeleteFileW(audioTmp.c_str());
+
+                if (muxSuccess) {
+                    WIN32_FILE_ATTRIBUTE_DATA fad;
+                    uint64_t finalSize = 0;
+                    if (GetFileAttributesExW(item.savePath.c_str(), GetFileExInfoStandard, &fad)) {
+                        finalSize = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        for (auto& d : m_downloads) {
+                            if (d.id == id) {
+                                d.status = DownloadStatus::Complete;
+                                d.downloadedBytes = (finalSize > 0) ? finalSize : d.sizeBytes;
+                                d.sizeBytes = (finalSize > 0) ? finalSize : d.sizeBytes;
+                                d.speedBytesPerSec = 0;
+                                break;
+                            }
+                        }
+                    }
+                    SaveHistory();
+                    if (m_onStatus) m_onStatus(id, DownloadStatus::Complete);
+                } else {
+                    CleanupDownloadDiskFiles(item, true);
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        for (auto& d : m_downloads) {
+                            if (d.id == id) {
+                                d.status = DownloadStatus::Error;
+                                d.diagnosticText = L"FFmpeg muxing failed. Temporary files cleaned up.";
+                                break;
+                            }
+                        }
+                    }
+                    if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
+                }
+            } else if (videoFailed.load() || audioFailed.load()) {
+                CleanupDownloadDiskFiles(item, true);
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    for (auto& d : m_downloads) {
+                        if (d.id == id) {
+                            d.status = DownloadStatus::Error;
+                            d.diagnosticText = L"Stream connection failed. Temporary files cleaned up.";
+                            break;
+                        }
+                    }
+                }
+                if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    for (auto& d : m_downloads) {
+                        if (d.id == id) {
+                            d.status = DownloadStatus::Paused;
+                            break;
+                        }
+                    }
+                }
+                if (m_onStatus) m_onStatus(id, DownloadStatus::Paused);
+            }
+            return;
+        } else {
+            // Single Stream (e.g. 720p / 360p or Audio only)
+            item.url = streams.videoUrl;
         }
     }
 
-    // Case 2: Segmented HTTP/HTTPS Range Downloader (Native SegmentedDownloader Engine)
+    // Direct Segmented HTTP/HTTPS Range Downloader (All direct files, TikTok, Instagram, Twitter, etc.)
     auto pDownloader = std::make_shared<SegmentedDownloader>();
     {
         std::lock_guard<std::mutex> lock(m_downloaderMutex);
@@ -539,6 +884,20 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
     }
 
     int conns = (item.connections > 0) ? item.connections : 16;
+    {
+      CreateDirectoryW(L"C:\\temp", NULL);
+      std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
+      if (dbg.is_open()) {
+        dbg << L"=== [ENGINE WORKER BEFORE START] ===" << std::endl;
+        dbg << L"ID: " << item.id << std::endl;
+        dbg << L"URL: " << item.url << std::endl;
+        dbg << L"Referer: " << item.referer << std::endl;
+        dbg << L"Cookies: " << item.cookies << std::endl;
+        dbg << L"UserAgent: " << item.userAgent << std::endl;
+        dbg << L"===================================" << std::endl << std::endl;
+        dbg.close();
+      }
+    }
     pDownloader->start(item.url, item.savePath, conns, [this, id](const DownloadStats& stats) {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -546,39 +905,18 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                 if (d.id == id) {
                     d.downloadedBytes = stats.downloadedBytes;
                     d.sizeBytes = stats.totalSize;
-                    d.speedBytesPerSec = stats.smoothedSpeedBps;
+                    d.speedBytesPerSec = (uint64_t)stats.smoothedSpeedBps;
                     d.diagnosticText = stats.diagnosticText;
 
-                    // Sync segment states & live stream telemetry to chunk list for visualizer
-                    if (d.chunks.size() != stats.segments.size()) {
-                        d.chunks.clear();
-                        for (const auto& s : stats.segments) {
-                            DownloadChunk c;
-                            c.id = s.id + 1;
-                            c.startByte = s.start;
-                            c.endByte = s.end;
-                            c.downloadedBytes = s.downloadedBytes.load(std::memory_order_relaxed);
-                            c.active = (s.status == SegmentStatus::Downloading);
-                            c.completed = (s.status == SegmentStatus::Completed);
-                            c.state = (ChunkState)s.state.load(std::memory_order_relaxed);
-                            c.latencyMs = s.latencyMs.load(std::memory_order_relaxed);
-                            d.chunks.push_back(c);
-                        }
-                    } else {
-                        for (size_t i = 0; i < stats.segments.size(); ++i) {
-                            d.chunks[i].downloadedBytes = stats.segments[i].downloadedBytes.load(std::memory_order_relaxed);
-                            d.chunks[i].active = (stats.segments[i].status == SegmentStatus::Downloading);
-                            d.chunks[i].completed = (stats.segments[i].status == SegmentStatus::Completed);
-                            d.chunks[i].state = (ChunkState)stats.segments[i].state.load(std::memory_order_relaxed);
-                            d.chunks[i].latencyMs = stats.segments[i].latencyMs.load(std::memory_order_relaxed);
-                        }
-                    }
-
-                    if (stats.isComplete) {
+                    if (stats.isComplete && stats.downloadedBytes > 0) {
                         d.status = DownloadStatus::Complete;
                         d.speedBytesPerSec = 0;
+                    } else if (stats.isComplete && stats.downloadedBytes == 0) {
+                        d.status = DownloadStatus::Error;
+                        d.diagnosticText = L"Remote server returned 0 bytes or an invalid stream response.";
+                        d.speedBytesPerSec = 0;
                     } else if (stats.isFailed) {
-                        d.status = DownloadStatus::Paused; // Paused on error for user resume
+                        d.status = DownloadStatus::Paused;
                         d.speedBytesPerSec = 0;
                     }
                     break;
@@ -587,20 +925,190 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
         }
 
         if (m_onProgress) {
-            m_onProgress(id, stats.downloadedBytes, stats.totalSize, stats.smoothedSpeedBps);
+            m_onProgress(id, stats.downloadedBytes, stats.totalSize, (uint64_t)stats.smoothedSpeedBps);
         }
 
-        if (stats.isComplete) {
+        if (stats.isComplete && stats.downloadedBytes > 0) {
             SaveHistory();
             if (m_onStatus) m_onStatus(id, DownloadStatus::Complete);
+        } else if (stats.isComplete && stats.downloadedBytes == 0) {
+            SaveHistory();
+            if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
         } else if (stats.isFailed) {
             SaveHistory();
             if (m_onStatus) m_onStatus(id, DownloadStatus::Paused);
         }
-    });
+    }, item.cookies, item.referer, item.userAgent);
 
-    // Keep pDownloader alive and running
     while (pDownloader->isRunning()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+}
+
+std::string DownloadEngine::ProbeFormatSizesJson(const std::wstring& pageUrl) {
+    if (!DownloadEngine::IsStreamingMediaURL(pageUrl)) {
+        return "{\"status\":\"ok\",\"formats\":{}}";
+    }
+
+    wchar_t szPath[MAX_PATH] = { 0 };
+    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+    PathRemoveFileSpecW(szPath);
+
+    std::wstring ytDlp = std::wstring(szPath) + L"\\..\\..\\tools\\yt-dlp.exe";
+    if (!PathFileExistsW(ytDlp.c_str())) {
+        ytDlp = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
+    }
+
+    // Fast probe for standard heights and audio streams
+    std::wstring fmt = L"bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio,bestvideo[height<=720]+bestaudio/bestvideo+bestaudio,bestvideo[height<=480]+bestaudio/bestvideo+bestaudio,bestaudio[acodec^=mp4a]/bestaudio";
+    std::wstring cmd = L"\"" + ytDlp + L"\" --no-playlist --no-warnings -f \"" + fmt + L"\" --print \"%(height)s|%(filesize,filesize_approx)s\" \"" + pageUrl + L"\"";
+
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    HANDLE hReadPipe, hWritePipe;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return "{\"status\":\"ok\",\"formats\":{}}";
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = { 0 };
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+
+    BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+    CloseHandle(hWritePipe);
+
+    if (!success) {
+        CloseHandle(hReadPipe);
+        return "{\"status\":\"ok\",\"formats\":{}}";
+    }
+
+    std::string out;
+    char buffer[2048];
+    DWORD bytesRead = 0;
+    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = 0;
+        out += buffer;
+    }
+    CloseHandle(hReadPipe);
+
+    WaitForSingleObject(pi.hProcess, 8000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    uint64_t size1080 = 0, size720 = 0, size480 = 0, sizeAudio = 0;
+    std::stringstream ss(out);
+    std::string line;
+    while (std::getline(ss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) line.pop_back();
+        size_t pipePos = line.find('|');
+        if (pipePos != std::string::npos) {
+            std::string key = line.substr(0, pipePos);
+            std::string valStr = line.substr(pipePos + 1);
+            try {
+                uint64_t bytes = std::stoull(valStr);
+                if (key == "1080" && size1080 == 0) size1080 = bytes;
+                else if (key == "720" && size720 == 0) size720 = bytes;
+                else if (key == "480" && size480 == 0) size480 = bytes;
+                else if (key == "NA" && sizeAudio == 0) sizeAudio = bytes;
+            } catch (...) {}
+        }
+    }
+
+    std::ostringstream json;
+    json << "{\"status\":\"ok\",\"formats\":{"
+         << "\"1080p\":" << size1080 << ","
+         << "\"720p\":" << size720 << ","
+         << "\"480p\":" << size480 << ","
+         << "\"audio\":" << sizeAudio
+         << "}}";
+    return json.str();
+}
+
+std::wstring DownloadEngine::GetMediaTitle(const std::wstring& pageUrl) {
+    if (!DownloadEngine::IsStreamingMediaURL(pageUrl)) {
+        return L"";
+    }
+
+    wchar_t szPath[MAX_PATH] = { 0 };
+    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+    PathRemoveFileSpecW(szPath);
+
+    std::wstring ytDlp = std::wstring(szPath) + L"\\..\\..\\tools\\yt-dlp.exe";
+    if (!PathFileExistsW(ytDlp.c_str())) {
+        ytDlp = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
+    }
+
+    std::wstring cmd = L"\"" + ytDlp + L"\" --encoding utf-8 --no-check-certificates --no-warnings --no-playlist --socket-timeout 5 --print \"%(title)s\" \"" + pageUrl + L"\"";
+
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    HANDLE hReadPipe, hWritePipe;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return L"";
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = { 0 };
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+
+    BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+    CloseHandle(hWritePipe);
+
+    if (!success) {
+        CloseHandle(hReadPipe);
+        return L"";
+    }
+
+    std::string out;
+    char buffer[1024];
+    DWORD bytesRead = 0;
+    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = 0;
+        out += buffer;
+    }
+    CloseHandle(hReadPipe);
+
+    WaitForSingleObject(pi.hProcess, 12000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == ' ')) out.pop_back();
+    while (!out.empty() && (out.front() == ' ')) out.erase(out.begin());
+
+    if (!out.empty()) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, out.c_str(), (int)out.length(), NULL, 0);
+        std::wstring title;
+        if (len > 0) {
+            title.resize(len);
+            MultiByteToWideChar(CP_UTF8, 0, out.c_str(), (int)out.length(), &title[0], len);
+        } else {
+            len = MultiByteToWideChar(CP_ACP, 0, out.c_str(), (int)out.length(), NULL, 0);
+            if (len > 0) {
+                title.resize(len);
+                MultiByteToWideChar(CP_ACP, 0, out.c_str(), (int)out.length(), &title[0], len);
+            }
+        }
+
+        for (auto& ch : title) {
+            if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
+                ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
+                ch = L' ';
+            }
+        }
+        while (!title.empty() && (title.back() == L' ' || title.back() == L'\t')) title.pop_back();
+        while (!title.empty() && (title.front() == L' ' || title.front() == L'\t')) title.erase(title.begin());
+        if (title.length() > 120) title = title.substr(0, 120);
+
+        return title;
+    }
+
+    return L"";
 }

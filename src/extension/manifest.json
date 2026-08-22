@@ -3,6 +3,11 @@
   "name": "AB Download Manager Companion",
   "version": "1.0.0",
   "description": "Companion media sniffer & download interception extension for AB Download Manager. Sniffs HLS .m3u8, MPEG-DASH .mpd, video/audio chunks, and direct file streams.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "permissions": [
     "nativeMessaging",
     "downloads",
@@ -15,7 +20,7 @@
   ],
   "host_permissions": [
     "<all_urls>",
-    "http://127.0.0.1:8989/"
+    "http://127.0.0.1:9898/"
   ],
   "background": {
     "service_worker": "background.js"
@@ -28,8 +33,19 @@
       "all_frames": true
     }
   ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icon16.png", "icon48.png", "icon128.png"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "AB Media Sniffer"
+    "default_title": "AB Download Manager",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
   }
 }
