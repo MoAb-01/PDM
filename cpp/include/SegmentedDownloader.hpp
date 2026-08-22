@@ -312,8 +312,17 @@ public:
         m_totalSize = totalSize;
         m_supportsRange = supportsRange;
 
+        // Dynamic Segment Scaling: Avoid opening 16 connections for tiny files (<512KB) which causes CDN throttling
         if (!m_supportsRange || m_totalSize == 0) {
             m_numSegments = 1;
+        } else if (m_totalSize < 512 * 1024) {
+            m_numSegments = 1;
+        } else if (m_totalSize < 2 * 1024 * 1024) {
+            m_numSegments = 4;
+        } else if (m_totalSize < 10 * 1024 * 1024) {
+            m_numSegments = 8;
+        } else {
+            m_numSegments = (numSegments > 0) ? ((numSegments <= MAX_STREAMS) ? numSegments : MAX_STREAMS) : 16;
         }
 
         // 2. Pre-allocate destination file if total size is known
@@ -590,117 +599,125 @@ private:
             return;
         }
 
-        HINTERNET hConnect = WinHttpConnect(m_hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
-        if (!hConnect) {
-            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
-            return;
-        }
+        constexpr int MAX_ATTEMPTS = 5;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS && m_running; ++attempt) {
+            uint64_t initialStart = (*m_liveSlots)[id].startByte.load(std::memory_order_relaxed);
+            uint64_t alreadyDownloaded = (*m_liveSlots)[id].downloadedBytes.load(std::memory_order_relaxed);
+            uint64_t start = initialStart + alreadyDownloaded;
+            uint64_t end = (*m_liveSlots)[id].endByte.load(std::memory_order_relaxed);
 
-        DWORD flags = m_pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
-        HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", m_pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-        if (!hReq) {
-            WinHttpCloseHandle(hConnect);
-            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
-            return;
-        }
-
-        uint64_t initialStart = (*m_liveSlots)[id].startByte.load(std::memory_order_relaxed);
-        uint64_t alreadyDownloaded = (*m_liveSlots)[id].downloadedBytes.load(std::memory_order_relaxed);
-        uint64_t start = initialStart + alreadyDownloaded;
-        uint64_t end = (*m_liveSlots)[id].endByte.load(std::memory_order_relaxed);
-
-        if (start > end && end > 0) {
-            (*m_liveSlots)[id].state.store(ChunkState::Completed, std::memory_order_relaxed);
-            (*m_liveSlots)[id].completed.store(true, std::memory_order_relaxed);
-            (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
-            WinHttpCloseHandle(hReq);
-            WinHttpCloseHandle(hConnect);
-            return;
-        }
-
-        if (m_supportsRange && end > 0) {
-            std::wstring range = L"Range: bytes=" + std::to_wstring(start) + L"-" + std::to_wstring(end) + L"\r\n";
-            WinHttpAddRequestHeaders(hReq, range.c_str(), (DWORD)range.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        }
-
-        DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-        WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
-
-        DWORD disableCache = 1;
-        WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
-
-        auto t0 = std::chrono::steady_clock::now();
-        if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-            !WinHttpReceiveResponse(hReq, NULL)) {
-            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
-            WinHttpCloseHandle(hReq);
-            WinHttpCloseHandle(hConnect);
-            return;
-        }
-
-        DWORD statusCode = 0;
-        DWORD statusSize = sizeof(statusCode);
-        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
-        if (statusCode != 200 && statusCode != 206) {
-            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
-            WinHttpCloseHandle(hReq);
-            WinHttpCloseHandle(hConnect);
-            return;
-        }
-
-        auto t1 = std::chrono::steady_clock::now();
-        uint32_t lat = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        if (lat == 0) lat = 1;
-        (*m_liveSlots)[id].latencyMs.store(lat, std::memory_order_relaxed);
-
-        // Open independent local file handle for multi-threaded overlapped writing
-        HANDLE hLocalFile = CreateFileW(
-            m_outputPath.c_str(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL
-        );
-
-        constexpr DWORD BUF_SIZE = 65536; // 64KB high throughput buffer
-        std::vector<BYTE> buf(BUF_SIZE);
-        DWORD bytesRead = 0;
-        uint64_t currentOffset = start;
-
-        (*m_liveSlots)[id].state.store(ChunkState::Receiving, std::memory_order_relaxed);
-
-        while (m_running && WinHttpReadData(hReq, buf.data(), BUF_SIZE, &bytesRead) && bytesRead > 0) {
-            if (hLocalFile != INVALID_HANDLE_VALUE) {
-                OVERLAPPED ov = { 0 };
-                ov.Offset = (DWORD)(currentOffset & 0xFFFFFFFF);
-                ov.OffsetHigh = (DWORD)(currentOffset >> 32);
-                DWORD written = 0;
-                WriteFile(hLocalFile, buf.data(), bytesRead, &written, &ov);
+            if (start > end && end > 0) {
+                (*m_liveSlots)[id].state.store(ChunkState::Completed, std::memory_order_relaxed);
+                (*m_liveSlots)[id].completed.store(true, std::memory_order_relaxed);
+                (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
+                return;
             }
 
-            currentOffset += bytesRead;
-            (*m_liveSlots)[id].downloadedBytes.fetch_add(bytesRead, std::memory_order_relaxed);
-            m_totalDownloadedBytes.fetch_add(bytesRead, std::memory_order_relaxed);
-            (*m_liveSlots)[id].lastPacketTime.store(GetTickCount64(), std::memory_order_relaxed);
+            if (attempt > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+            }
+
+            (*m_liveSlots)[id].state.store(ChunkState::Connecting, std::memory_order_relaxed);
+            (*m_liveSlots)[id].active.store(true, std::memory_order_relaxed);
+
+            HINTERNET hConnect = WinHttpConnect(m_hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
+            if (!hConnect) {
+                continue;
+            }
+
+            DWORD flags = m_pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
+            HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", m_pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+            if (!hReq) {
+                WinHttpCloseHandle(hConnect);
+                continue;
+            }
+
+            if (m_supportsRange && end > 0) {
+                std::wstring range = L"Range: bytes=" + std::to_wstring(start) + L"-" + std::to_wstring(end) + L"\r\n";
+                WinHttpAddRequestHeaders(hReq, range.c_str(), (DWORD)range.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+
+            DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+            WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
+
+            DWORD disableCache = 1;
+            WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
+
+            auto t0 = std::chrono::steady_clock::now();
+            if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+                !WinHttpReceiveResponse(hReq, NULL)) {
+                WinHttpCloseHandle(hReq);
+                WinHttpCloseHandle(hConnect);
+                continue;
+            }
+
+            DWORD statusCode = 0;
+            DWORD statusSize = sizeof(statusCode);
+            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+            if (statusCode != 200 && statusCode != 206) {
+                WinHttpCloseHandle(hReq);
+                WinHttpCloseHandle(hConnect);
+                continue;
+            }
+
+            auto t1 = std::chrono::steady_clock::now();
+            uint32_t lat = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+            if (lat == 0) lat = 1;
+            (*m_liveSlots)[id].latencyMs.store(lat, std::memory_order_relaxed);
+
+            // Open independent local file handle for multi-threaded overlapped writing
+            HANDLE hLocalFile = CreateFileW(
+                m_outputPath.c_str(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                NULL
+            );
+
+            constexpr DWORD BUF_SIZE = 65536; // 64KB high throughput buffer
+            std::vector<BYTE> buf(BUF_SIZE);
+            DWORD bytesRead = 0;
+            uint64_t currentOffset = start;
+
+            (*m_liveSlots)[id].state.store(ChunkState::Receiving, std::memory_order_relaxed);
+
+            while (m_running && WinHttpReadData(hReq, buf.data(), BUF_SIZE, &bytesRead) && bytesRead > 0) {
+                if (hLocalFile != INVALID_HANDLE_VALUE) {
+                    OVERLAPPED ov = { 0 };
+                    ov.Offset = (DWORD)(currentOffset & 0xFFFFFFFF);
+                    ov.OffsetHigh = (DWORD)(currentOffset >> 32);
+                    DWORD written = 0;
+                    WriteFile(hLocalFile, buf.data(), bytesRead, &written, &ov);
+                }
+
+                currentOffset += bytesRead;
+                (*m_liveSlots)[id].downloadedBytes.fetch_add(bytesRead, std::memory_order_relaxed);
+                m_totalDownloadedBytes.fetch_add(bytesRead, std::memory_order_relaxed);
+                (*m_liveSlots)[id].lastPacketTime.store(GetTickCount64(), std::memory_order_relaxed);
+            }
+
+            if (hLocalFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hLocalFile);
+            }
+
+            WinHttpCloseHandle(hReq);
+            WinHttpCloseHandle(hConnect);
+
+            bool complete = (end > 0) ? (currentOffset > end) : (currentOffset > 0);
+            if (complete) {
+                (*m_liveSlots)[id].state.store(ChunkState::Completed, std::memory_order_relaxed);
+                (*m_liveSlots)[id].completed.store(true, std::memory_order_relaxed);
+                (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
+                return;
+            }
         }
 
-        if (hLocalFile != INVALID_HANDLE_VALUE) {
-            CloseHandle(hLocalFile);
-        }
-
-        bool complete = (end > 0) ? (currentOffset > end) : (currentOffset > 0);
-        if (complete) {
-            (*m_liveSlots)[id].state.store(ChunkState::Completed, std::memory_order_relaxed);
-            (*m_liveSlots)[id].completed.store(true, std::memory_order_relaxed);
-            (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
-        } else {
+        if (!(*m_liveSlots)[id].completed.load(std::memory_order_relaxed)) {
             (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
+            (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
         }
-
-        WinHttpCloseHandle(hReq);
-        WinHttpCloseHandle(hConnect);
     }
 
     void monitorWorker() {
