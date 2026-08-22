@@ -2,6 +2,9 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <array>
+#include <atomic>
+#include <memory>
 #include <chrono>
 
 enum class DownloadStatus {
@@ -21,6 +24,42 @@ enum class ChunkState {
     Stalled,
     Completed,
     Error
+};
+
+struct alignas(64) LiveStreamSlot {
+    std::atomic<uint64_t> downloadedBytes{ 0 };
+    std::atomic<uint64_t> startByte{ 0 };
+    std::atomic<uint64_t> endByte{ 0 };
+    std::atomic<uint64_t> lastPacketTime{ 0 };
+    std::atomic<uint32_t> latencyMs{ 0 };
+    std::atomic<bool> active{ false };
+    std::atomic<bool> completed{ false };
+    std::atomic<ChunkState> state{ ChunkState::Idle };
+
+    LiveStreamSlot() = default;
+    LiveStreamSlot(const LiveStreamSlot& other) {
+        downloadedBytes.store(other.downloadedBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        startByte.store(other.startByte.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        endByte.store(other.endByte.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        lastPacketTime.store(other.lastPacketTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        latencyMs.store(other.latencyMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        active.store(other.active.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        completed.store(other.completed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        state.store(other.state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    LiveStreamSlot& operator=(const LiveStreamSlot& other) {
+        if (this != &other) {
+            downloadedBytes.store(other.downloadedBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startByte.store(other.startByte.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            endByte.store(other.endByte.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lastPacketTime.store(other.lastPacketTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            latencyMs.store(other.latencyMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            active.store(other.active.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            completed.store(other.completed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            state.store(other.state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
 };
 
 struct DownloadChunk {
@@ -51,11 +90,14 @@ struct DownloadItem {
     uint64_t downloadedBytes = 0;
     uint64_t speedBytesPerSec = 0;
     int connections = 8;
-    DownloadStatus status = DownloadStatus::Complete;
+    DownloadStatus status = DownloadStatus::Downloading;
     bool resumeSupported = true;
 
     std::vector<DownloadChunk> chunks;
     std::wstring diagnosticText = L"Active: 0 | Stalled: 0 | Connecting: 0 | Avg Latency: 0 ms";
+
+    // Lock-Free 60 FPS UI Telemetry
+    std::shared_ptr<std::array<LiveStreamSlot, 16>> liveSlots = std::make_shared<std::array<LiveStreamSlot, 16>>();
 };
 
 struct IDMSettings {

@@ -387,14 +387,23 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
                 ChunkState cState = ChunkState::Idle;
                 double ratio = 0.0;
 
-                if (pState->pItem->chunks.size() > (size_t)i) {
+                if (pState->pItem && pState->pItem->liveSlots) {
+                    const auto& slot = (*pState->pItem->liveSlots)[i];
+                    cState = slot.state.load(std::memory_order_relaxed);
+                    uint64_t sB = slot.startByte.load(std::memory_order_relaxed);
+                    uint64_t eB = slot.endByte.load(std::memory_order_relaxed);
+                    uint64_t dB = slot.downloadedBytes.load(std::memory_order_relaxed);
+                    uint64_t chunkRange = (eB > sB) ? (eB - sB + 1) : 1;
+                    ratio = (chunkRange > 0) ? ((double)dB / (double)chunkRange) : 0.0;
+                    if (ratio > 1.0) ratio = 1.0;
+                } else if (pState->pItem && pState->pItem->chunks.size() > (size_t)i) {
                     const auto& chunk = pState->pItem->chunks[i];
                     cState = chunk.state;
                     uint64_t chunkRange = (chunk.endByte > chunk.startByte) ? (chunk.endByte - chunk.startByte + 1) : 1;
                     ratio = (double)chunk.downloadedBytes / (double)chunkRange;
                     if (ratio > 1.0) ratio = 1.0;
                 } else {
-                    double overallProgressRatio = (pState->pItem->sizeBytes > 0)
+                    double overallProgressRatio = (pState->pItem && pState->pItem->sizeBytes > 0)
                         ? (pState->currentVisualDownloadedBytes / (double)pState->pItem->sizeBytes)
                         : 0.0;
                     if (overallProgressRatio > 1.0) overallProgressRatio = 1.0;
@@ -402,13 +411,13 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
                     double chunkStartRatio = (double)i / (double)numSegments;
                     double chunkEndRatio = (double)(i + 1) / (double)numSegments;
 
-                    if (overallProgressRatio >= chunkEndRatio || pState->pItem->status == DownloadStatus::Complete) {
+                    if (overallProgressRatio >= chunkEndRatio || (pState->pItem && pState->pItem->status == DownloadStatus::Complete)) {
                         cState = ChunkState::Completed;
                         ratio = 1.0;
                     } else if (overallProgressRatio >= chunkStartRatio) {
                         cState = ChunkState::Receiving;
                         ratio = (overallProgressRatio - chunkStartRatio) / (chunkEndRatio - chunkStartRatio);
-                    } else if (pState->pItem->status == DownloadStatus::Downloading) {
+                    } else if (pState->pItem && pState->pItem->status == DownloadStatus::Downloading) {
                         cState = ChunkState::Receiving;
                         ratio = 0.0;
                     }
@@ -631,8 +640,16 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
 
             // 6. Update Connections Box
             int activeConns = 0;
-            for (const auto& c : item.chunks) {
-                if (c.active || c.completed) activeConns++;
+            if (item.liveSlots) {
+                for (int i = 0; i < 16; ++i) {
+                    bool act = (*item.liveSlots)[i].active.load(std::memory_order_relaxed);
+                    bool cmp = (*item.liveSlots)[i].completed.load(std::memory_order_relaxed);
+                    if (act || cmp) activeConns++;
+                }
+            } else {
+                for (const auto& c : item.chunks) {
+                    if (c.active || c.completed) activeConns++;
+                }
             }
             if (activeConns == 0 && item.status == DownloadStatus::Downloading) activeConns = 16;
             pState->strConnections = std::to_wstring(activeConns) + L" / 16 active";
@@ -646,10 +663,19 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
                 pState->colorStatus = RGB(255, 165, 0);
             } else {
                 int active = 0, stalled = 0, connecting = 0;
-                for (const auto& c : item.chunks) {
-                    if (c.state == ChunkState::Receiving || c.state == ChunkState::WritingDisk) active++;
-                    else if (c.state == ChunkState::Connecting) connecting++;
-                    else if (c.state == ChunkState::Stalled) stalled++;
+                if (item.liveSlots) {
+                    for (int i = 0; i < 16; ++i) {
+                        ChunkState st = (*item.liveSlots)[i].state.load(std::memory_order_relaxed);
+                        if (st == ChunkState::Receiving || st == ChunkState::WritingDisk) active++;
+                        else if (st == ChunkState::Connecting) connecting++;
+                        else if (st == ChunkState::Stalled) stalled++;
+                    }
+                } else {
+                    for (const auto& c : item.chunks) {
+                        if (c.state == ChunkState::Receiving || c.state == ChunkState::WritingDisk) active++;
+                        else if (c.state == ChunkState::Connecting) connecting++;
+                        else if (c.state == ChunkState::Stalled) stalled++;
+                    }
                 }
                 if (active == 0 && item.status == DownloadStatus::Downloading) {
                     active = 16;
@@ -720,6 +746,7 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
             if (pState->hFontBold8) DeleteObject(pState->hFontBold8);
             if (pState->hFontSmall7) DeleteObject(pState->hFontSmall7);
         }
+        PostQuitMessage(0);
         return 0;
     }
     }
@@ -736,6 +763,9 @@ struct StandaloneProgressThreadParam {
 static DWORD WINAPI StandaloneProgressThread(LPVOID lpParam) {
     StandaloneProgressThreadParam* pParam = (StandaloneProgressThreadParam*)lpParam;
     if (!pParam) return 0;
+
+    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icex);
 
     static bool s_classRegistered = false;
     if (!s_classRegistered) {
@@ -772,6 +802,10 @@ static DWORD WINAPI StandaloneProgressThread(LPVOID lpParam) {
     );
 
     if (!hDlg) {
+        DWORD err = GetLastError();
+        wchar_t errMsg[128];
+        swprintf_s(errMsg, L"Failed to create Download Progress Dialog. Error: %lu", err);
+        MessageBoxW(NULL, errMsg, L"UI Error", MB_ICONERROR | MB_OK);
         delete pState->pItem;
         delete pState;
         return 0;

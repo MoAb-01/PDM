@@ -6,9 +6,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <wininet.h>
-
-#pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 class DownloadEngine {
@@ -28,6 +25,7 @@ public:
 
     std::vector<DownloadItem> GetDownloads();
     DownloadItem GetItem(const std::wstring& id);
+    std::shared_ptr<std::array<LiveStreamSlot, 16>> GetLiveSlots(const std::wstring& id);
     std::shared_ptr<class SegmentedDownloader> GetActiveDownloader(const std::wstring& id);
     void UpdateItem(const DownloadItem& item);
     void DeleteItem(const std::wstring& id);

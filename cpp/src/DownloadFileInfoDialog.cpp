@@ -184,6 +184,7 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
             pState->startImmediately = true;
             pState->confirmed = true;
             DestroyWindow(hWnd);
+            PostMessageW(NULL, WM_NULL, 0, 0);
             return 0;
         }
 
@@ -196,12 +197,14 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
             pState->startImmediately = false;
             pState->confirmed = true;
             DestroyWindow(hWnd);
+            PostMessageW(NULL, WM_NULL, 0, 0);
             return 0;
         }
 
         if (id == IDCANCEL) {
             pState->confirmed = false;
             DestroyWindow(hWnd);
+            PostMessageW(NULL, WM_NULL, 0, 0);
             return 0;
         }
         break;
@@ -210,6 +213,7 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
     case WM_CLOSE: {
         if (pState) pState->confirmed = false;
         DestroyWindow(hWnd);
+        PostMessageW(NULL, WM_NULL, 0, 0);
         return 0;
     }
     }
@@ -218,9 +222,13 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
 }
 
 bool ShowDownloadFileInfoDialog(HWND hParent, DownloadItem& item, bool& outStartImmediately) {
+    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&icex);
+
     static bool s_classRegistered = false;
     if (!s_classRegistered) {
         WNDCLASSEXW wc = { sizeof(WNDCLASSEXW) };
+        wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.lpfnWndProc = DownloadFileInfoWndProc;
         wc.hInstance = GetModuleHandle(NULL);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -242,18 +250,35 @@ bool ShowDownloadFileInfoDialog(HWND hParent, DownloadItem& item, bool& outStart
         item.savePath = catDir + item.filename;
     }
 
+    int dlgW = 510;
+    int dlgH = 320;
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int x = (screenW - dlgW) / 2;
+    int y = (screenH - dlgH) / 2;
+
     HWND hDlg = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"IDM_DownloadFileInfoDialogClass",
         L"Download File Info",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 510, 320,
+        x, y, dlgW, dlgH,
         hParent, NULL, GetModuleHandle(NULL), &state
     );
 
-    if (!hDlg) return false;
+    if (!hDlg) {
+        DWORD err = GetLastError();
+        wchar_t errMsg[128];
+        swprintf_s(errMsg, L"Failed to create Download File Info Dialog. Error: %lu", err);
+        MessageBoxW(NULL, errMsg, L"UI Error", MB_ICONERROR | MB_OK);
+        return false;
+    }
 
     if (hParent) EnableWindow(hParent, FALSE);
+
+    ShowWindow(hDlg, SW_SHOWNORMAL);
+    UpdateWindow(hDlg);
+    SetForegroundWindow(hDlg);
 
     // Modal Message Loop
     MSG msg;

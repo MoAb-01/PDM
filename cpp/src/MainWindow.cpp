@@ -506,6 +506,29 @@ private:
         }
     }
 
+    std::wstring GetClipboardUrl() {
+        if (!OpenClipboard(m_hWnd)) return L"";
+        HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+        if (!hData) {
+            CloseClipboard();
+            return L"";
+        }
+        wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
+        std::wstring text = pszText ? pszText : L"";
+        GlobalUnlock(hData);
+        CloseClipboard();
+
+        size_t first = text.find_first_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) return L"";
+        size_t last = text.find_last_not_of(L" \t\r\n");
+        text = text.substr(first, (last - first + 1));
+
+        if (text.rfind(L"http://", 0) == 0 || text.rfind(L"https://", 0) == 0) {
+            return text;
+        }
+        return L"";
+    }
+
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         switch (message) {
         case WM_SIZE: {
@@ -566,6 +589,17 @@ private:
             if (req) {
                 TriggerAddFromUrl(req->url, req->filename, req->referer);
                 delete req;
+            }
+            return 0;
+        }
+
+        case WM_USER + 201: { // CLI-launched URL (deferred so message loop is running)
+            auto* pUrl = (std::wstring*)wParam;
+            if (pUrl) {
+                std::wstring url = *pUrl;
+                delete pUrl;
+                SetForegroundWindow(m_hWnd);
+                TriggerAddFromUrl(url);
             }
             return 0;
         }
@@ -647,18 +681,32 @@ private:
             int id = LOWORD(wParam);
 
             if (id == 1001) { // Add URL -> Launches the exact "Download File Info" dialog (screenshot replica)
+                OutputDebugStringW(L"[IDM Debug] Add URL Clicked\n");
                 DownloadItem item;
                 item.id = L"dl-" + std::to_wstring(GetTickCount());
-                item.url = L"https://www.internetdownloadmanager.com/languages/idm_al.zip";
-                item.filename = L"idm_al.zip";
-                item.category = L"Compressed";
-                item.savePath = L"C:\\Users\\UHD\\Downloads\\Compressed\\idm_al.zip";
+                
+                std::wstring clipUrl = GetClipboardUrl();
+                if (!clipUrl.empty()) {
+                    item.url = clipUrl;
+                    size_t slash = clipUrl.find_last_of(L'/');
+                    item.filename = (slash != std::wstring::npos && slash + 1 < clipUrl.length()) ? clipUrl.substr(slash + 1) : L"download.bin";
+                    size_t qmark = item.filename.find(L'?');
+                    if (qmark != std::wstring::npos) item.filename = item.filename.substr(0, qmark);
+                    item.category = L"General";
+                    item.savePath = L"C:\\Users\\UHD\\Downloads\\General\\" + item.filename;
+                } else {
+                    item.url = L"https://www.internetdownloadmanager.com/languages/idm_al.zip";
+                    item.filename = L"idm_al.zip";
+                    item.category = L"Compressed";
+                    item.savePath = L"C:\\Users\\UHD\\Downloads\\Compressed\\idm_al.zip";
+                }
+
                 item.sizeBytes = 0;
                 item.downloadedBytes = 0;
                 item.status = DownloadStatus::Downloading;
-                item.connections = 8;
-                item.lastTryDate = L"Aug 21, 2026";
-                item.description = L"Language translation archive package";
+                item.connections = 16;
+                item.lastTryDate = L"Aug 22, 2026";
+                item.description = L"Direct download";
 
                 bool startImmediately = true;
                 if (ShowDownloadFileInfoDialog(m_hWnd, item, startImmediately)) {
@@ -672,13 +720,15 @@ private:
                         ShowDownloadProgressDialog(m_hWnd, &item, &m_engine);
                     }
                 }
-            } else if (id == 2001) { // Resume
+            } else if (id == 2001) { // Resume / Start
+                OutputDebugStringW(L"[IDM Debug] Start Download Clicked\n");
                 int index = GetSelectedListViewIndex();
                 if (index >= 0) {
                     auto items = m_engine.GetDownloads();
                     if ((size_t)index < items.size()) {
                         m_engine.StartDownload(items[index].id);
                         PopulateListView();
+                        ShowDownloadProgressDialog(m_hWnd, &items[index], &m_engine);
                     }
                 }
             } else if (id == 2002) { // Stop
@@ -796,15 +846,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     UpdateWindow(hWnd);
     SetForegroundWindow(hWnd);
 
-    // Check if launched with a URL parameter from Chrome/Edge sniffer
+    // Check if launched with a URL parameter from Chrome/Edge sniffer.
+    // IMPORTANT: Post a deferred message (WM_USER+201) instead of calling
+    // TriggerAddFromUrl() directly here — the Win32 message loop hasn't
+    // started yet, so any modal dialog opened now would be unresponsive/frozen.
     std::wstring cmdLine = GetCommandLineW();
     size_t urlPos = cmdLine.find(L"--download-url \"");
     if (urlPos != std::wstring::npos) {
-        urlPos += 16;
+        urlPos += 16; // skip past --download-url "
         size_t endUrl = cmdLine.find(L"\"", urlPos);
         if (endUrl != std::wstring::npos) {
             std::wstring sniffedUrl = cmdLine.substr(urlPos, endUrl - urlPos);
-            win.TriggerAddFromUrl(sniffedUrl);
+            if (!sniffedUrl.empty()) {
+                // Heap-allocate so the pointer stays valid after WinMain returns control
+                PostMessageW(hWnd, WM_USER + 201, (WPARAM)(new std::wstring(sniffedUrl)), 0);
+            }
         }
     }
 

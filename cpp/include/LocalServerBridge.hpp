@@ -55,14 +55,43 @@ private:
         return result;
     }
 
+    static std::string UnescapeJsonString(const std::string& str) {
+        std::string res;
+        for (size_t i = 0; i < str.length(); ++i) {
+            if (str[i] == '\\' && i + 1 < str.length()) {
+                if (str[i + 1] == '/') {
+                    res += '/';
+                    ++i;
+                    continue;
+                } else if (str[i + 1] == '"') {
+                    res += '"';
+                    ++i;
+                    continue;
+                } else if (str[i + 1] == '\\') {
+                    res += '\\';
+                    ++i;
+                    continue;
+                }
+            }
+            res += str[i];
+        }
+        return res;
+    }
+
     std::string ExtractField(const std::string& json, const std::string& key) {
-        std::string search = "\"" + key + "\":\"";
-        size_t pos = json.find(search);
-        if (pos != std::string::npos) {
-            pos += search.length();
-            size_t endPos = json.find("\"", pos);
-            if (endPos != std::string::npos) {
-                return json.substr(pos, endPos - pos);
+        std::vector<std::string> patterns = {
+            "\"" + key + "\":\"",
+            "\"" + key + "\": \"",
+            "\"" + key + "\":  \""
+        };
+        for (const auto& search : patterns) {
+            size_t pos = json.find(search);
+            if (pos != std::string::npos) {
+                pos += search.length();
+                size_t endPos = json.find("\"", pos);
+                if (endPos != std::string::npos) {
+                    return UnescapeJsonString(json.substr(pos, endPos - pos));
+                }
             }
         }
         return "";
@@ -134,11 +163,9 @@ private:
                     std::string filename = ExtractField(body, "filename");
                     std::string referer = ExtractField(body, "referer");
 
-                    if (url.empty()) {
-                        url = "https://streams.example.com/video.mp4";
-                    }
+                    OutputDebugStringA(("[IDM Bridge] Received download: " + url + "\n").c_str());
 
-                    if (m_callback) {
+                    if (!url.empty() && m_callback) {
                         m_callback(Utf8ToWide(url), Utf8ToWide(filename), Utf8ToWide(referer));
                     }
 

@@ -116,31 +116,24 @@ function attachWidgetToPlayer(playerContainer, videoEl) {
 
     console.log("[IDM Extension] Triggering Download for:", payload);
 
-    // 1. Direct Local Bridge Trigger to C++ DownloadManagerAB.exe (Fastest & 100% Reliable)
-    fetch("http://127.0.0.1:8989/download", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    }).then(res => res.json()).then(data => {
-      console.log("[IDM Extension] Local bridge success:", data);
-    }).catch(err => {
-      console.log("[IDM Extension] Local bridge fallback to Native Messaging:", err);
-      // 2. Native Messaging Fallback with Context Validation Protection
-      try {
-        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
-          chrome.runtime.sendMessage({
-            type: "FORWARD_TO_IDM_APP",
-            payload: payload
-          }, () => {
+    // Route through background service worker — content scripts cannot
+    // make cross-origin fetch to http://127.0.0.1 in MV3; only background.js can.
+    try {
+      if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
+        chrome.runtime.sendMessage(
+          { type: "FORWARD_TO_IDM_APP", payload: payload },
+          (response) => {
             if (chrome.runtime.lastError) {
-              // Ignore benign disconnects
+              // Ignore stale context errors
+            } else {
+              console.log("[IDM Extension] Background bridge response:", response);
             }
-          });
-        }
-      } catch (e) {
-        console.warn("[IDM Extension] Extension context updated. Please refresh tab (F5).", e);
+          }
+        );
       }
-    });
+    } catch (e) {
+      console.warn("[IDM Extension] Extension context error. Please refresh tab (F5).", e);
+    }
   });
 
   playerContainer.appendChild(panel);

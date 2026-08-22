@@ -4,6 +4,6 @@
   "path": "d:\\Download Manager AB\\cpp\\build\\Release\\IDMNativeHost.exe",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://*/"
+    "chrome-extension://pdjocdhejioofdlclapekpkgippdlmhl/"
   ]
 }

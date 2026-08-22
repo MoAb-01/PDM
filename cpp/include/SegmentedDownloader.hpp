@@ -7,20 +7,29 @@
 #endif
 #include <windows.h>
 #include <winhttp.h>
-#include <string>
+#include <shlwapi.h>
+#include <shlobj.h>
 #include <vector>
 #include <deque>
 #include <thread>
-#include <mutex>
 #include <atomic>
+#include <memory>
 #include <chrono>
+#include <string>
 #include <cmath>
 #include <fstream>
 #include <functional>
 #include <sstream>
 #include <iomanip>
+#include "Models.hpp"
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
+
+#ifndef WINHTTP_ENABLE_COOKIES
+#define WINHTTP_ENABLE_COOKIES 0x00000001
+#endif
 
 #ifdef min
 #undef min
@@ -36,8 +45,8 @@ enum class SegmentStatus {
     Failed
 };
 
-enum class StreamState {
-    Idle,
+enum class StreamState : uint8_t {
+    Idle = 0,
     Connecting,
     Receiving,
     WritingDisk,
@@ -98,7 +107,7 @@ struct DownloadStats {
     double progressPercent = 0.0;
     uint64_t speedBps = 0;
     uint64_t smoothedSpeedBps = 0;
-    int64_t etaSeconds = -1; // -1 means stalled/unknown
+    int64_t etaSeconds = -1;
     std::string etaFormatted;
     std::string speedFormatted;
     std::vector<SegmentState> segments;
@@ -118,22 +127,36 @@ struct ParsedHttpUrl {
     bool valid = false;
 };
 
+inline void EnsureFolderExistsForFile(const std::wstring& filePath) {
+    wchar_t folder[MAX_PATH] = { 0 };
+    wcsncpy_s(folder, filePath.c_str(), MAX_PATH - 1);
+    PathRemoveFileSpecW(folder);
+    if (wcslen(folder) > 0) {
+        SHCreateDirectoryExW(NULL, folder, NULL);
+    }
+}
+
 static ParsedHttpUrl CrackHttpUrl(const std::wstring& url) {
     ParsedHttpUrl res;
     URL_COMPONENTS urlComp = { 0 };
     urlComp.dwStructSize = sizeof(urlComp);
     
     wchar_t hostName[512] = { 0 };
-    wchar_t urlPath[2048] = { 0 };
+    wchar_t urlPath[4096] = { 0 };
     
     urlComp.lpszHostName = hostName;
     urlComp.dwHostNameLength = 512;
     urlComp.lpszUrlPath = urlPath;
-    urlComp.dwUrlPathLength = 2048;
+    urlComp.dwUrlPathLength = 4096;
     
     if (WinHttpCrackUrl(url.c_str(), (DWORD)url.length(), 0, &urlComp)) {
-        res.host = hostName;
-        res.path = urlPath;
+        res.host = std::wstring(urlComp.lpszHostName, urlComp.dwHostNameLength);
+        res.path = std::wstring(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
+        
+        if (res.path.empty()) {
+            res.path = L"/";
+        }
+
         res.port = urlComp.nPort;
         res.isHttps = (urlComp.nScheme == INTERNET_SCHEME_HTTPS);
         res.valid = true;
@@ -144,10 +167,12 @@ static ParsedHttpUrl CrackHttpUrl(const std::wstring& url) {
 class SegmentedDownloader {
 public:
     using StatsCallback = std::function<void(const DownloadStats& stats)>;
+    static constexpr int MAX_STREAMS = 16;
+    static constexpr const wchar_t* USER_AGENT = L"Wget/1.21.4 (win32) DownloadManagerAB/2.0";
 
     SegmentedDownloader() = default;
     ~SegmentedDownloader() {
-        cancel();
+        stop();
     }
 
     bool probeUrl(const std::wstring& url, uint64_t& outSize, bool& outSupportsRange, std::wstring& outFileName) {
@@ -155,7 +180,7 @@ public:
         if (!pUrl.valid) return false;
 
         HINTERNET hSession = WinHttpOpen(
-            L"AB Download Manager 1.0 (WinHTTP Engine)",
+            USER_AGENT,
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             WINHTTP_NO_PROXY_NAME,
             WINHTTP_NO_PROXY_BYPASS,
@@ -163,88 +188,110 @@ public:
         );
         if (!hSession) return false;
 
+        DWORD cookiePolicy = WINHTTP_ENABLE_COOKIES;
+        WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_FEATURE, &cookiePolicy, sizeof(cookiePolicy));
         DWORD maxConns = 64;
         WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
         WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
-        WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 8000);
+        WinHttpSetTimeouts(hSession, 10000, 10000, 10000, 15000);
 
-        HINTERNET hConnect = WinHttpConnect(hSession, pUrl.host.c_str(), pUrl.port, 0);
-        if (!hConnect) {
+        HINTERNET hConn = WinHttpConnect(hSession, pUrl.host.c_str(), pUrl.port, 0);
+        if (!hConn) {
             WinHttpCloseHandle(hSession);
             return false;
         }
 
         DWORD flags = pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-        if (!hRequest) {
-            WinHttpCloseHandle(hConnect);
+        HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hReq) {
+            WinHttpCloseHandle(hConn);
             WinHttpCloseHandle(hSession);
             return false;
         }
 
-        std::wstring headers = L"Range: bytes=0-0\r\n";
-        WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)headers.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        DWORD redir = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &redir, sizeof(redir));
 
-        DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
+        DWORD noCache = 1;
+        WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &noCache, sizeof(noCache));
 
-        DWORD disableCache = 1;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
+        std::wstring rHdr = L"Range: bytes=0-0\r\n";
+        WinHttpAddRequestHeaders(hReq, rHdr.c_str(), (DWORD)rHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
 
-        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-            !WinHttpReceiveResponse(hRequest, NULL)) {
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            return false;
-        }
+        if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(hReq, NULL)) {
 
-        DWORD statusCode = 0;
-        DWORD statusSize = sizeof(statusCode);
-        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+            // Resolve final redirected URL
+            DWORD finalUrlSize = 0;
+            WinHttpQueryOption(hReq, WINHTTP_OPTION_URL, NULL, &finalUrlSize);
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && finalUrlSize > 0) {
+                std::vector<wchar_t> finalUrl(finalUrlSize / sizeof(wchar_t) + 1);
+                if (WinHttpQueryOption(hReq, WINHTTP_OPTION_URL, finalUrl.data(), &finalUrlSize)) {
+                    std::wstring resolved = finalUrl.data();
+                    if (!resolved.empty()) {
+                        m_url = resolved;
+                        m_pUrl = CrackHttpUrl(resolved);
+                    }
+                }
+            }
 
-        outSupportsRange = (statusCode == 206);
+            DWORD sc = 0, scSz = sizeof(sc);
+            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scSz, WINHTTP_NO_HEADER_INDEX);
 
-        wchar_t contentRange[256] = { 0 };
-        DWORD crSize = sizeof(contentRange);
-        if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX, contentRange, &crSize, WINHTTP_NO_HEADER_INDEX)) {
-            std::wstring crStr = contentRange;
-            size_t slash = crStr.find(L'/');
-            if (slash != std::wstring::npos && slash + 1 < crStr.length()) {
-                try {
-                    outSize = std::stoull(crStr.substr(slash + 1));
-                    outSupportsRange = true;
-                } catch (...) {}
+            if (sc == 206) {
+                outSupportsRange = true;
+                wchar_t cr[256] = { 0 };
+                DWORD crSz = sizeof(cr);
+                if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX, cr, &crSz, WINHTTP_NO_HEADER_INDEX)) {
+                    std::wstring crStr = cr;
+                    size_t slash = crStr.find(L'/');
+                    if (slash != std::wstring::npos && slash + 1 < crStr.length()) {
+                        try { outSize = std::stoull(crStr.substr(slash + 1)); } catch (...) {}
+                    }
+                }
+            } else if (sc == 200) {
+                DWORD cl = 0, clSz = sizeof(cl);
+                if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &cl, &clSz, WINHTTP_NO_HEADER_INDEX)) {
+                    outSize = cl;
+                }
+                wchar_t ar[64] = { 0 };
+                DWORD arSz = sizeof(ar);
+                if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, L"Accept-Ranges", ar, &arSz, WINHTTP_NO_HEADER_INDEX)) {
+                    if (std::wstring(ar).find(L"bytes") != std::wstring::npos) {
+                        outSupportsRange = true;
+                    }
+                }
+            }
+
+            // Drain small body
+            DWORD avail = 0;
+            WinHttpQueryDataAvailable(hReq, &avail);
+            if (avail > 0) {
+                std::vector<BYTE> trash(avail);
+                DWORD got = 0;
+                WinHttpReadData(hReq, trash.data(), avail, &got);
             }
         }
 
-        if (outSize == 0) {
-            DWORD cl = 0;
-            DWORD clSize = sizeof(cl);
-            if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &cl, &clSize, WINHTTP_NO_HEADER_INDEX)) {
-                outSize = cl;
-            }
-        }
-
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hReq);
+        WinHttpCloseHandle(hConn);
         WinHttpCloseHandle(hSession);
         return true;
     }
 
-    bool start(const std::wstring& url, const std::wstring& outputPath, int numSegments = 8, StatsCallback callback = nullptr) {
-        cancel();
+    bool start(const std::wstring& url, const std::wstring& outputPath, int numSegments = 16, StatsCallback callback = nullptr) {
+        stop();
 
         m_url = url;
         m_outputPath = outputPath;
-        m_numSegments = (numSegments > 0) ? numSegments : 8;
+        m_numSegments = (numSegments > 0) ? ((numSegments <= MAX_STREAMS) ? numSegments : MAX_STREAMS) : 16;
         m_callback = callback;
         m_running = true;
         m_paused = false;
         m_completed = false;
+        m_failed = false;
         m_totalDownloadedBytes.store(0, std::memory_order_relaxed);
 
-        // Reset speed & ETA tracking
         m_smoothedSpeed = 0.0;
         m_lastReportedEta = -1;
         m_speedDropStartTime = std::chrono::steady_clock::time_point::min();
@@ -252,6 +299,9 @@ public:
         m_samples.clear();
 
         m_pUrl = CrackHttpUrl(url);
+
+        // Ensure directory exists
+        EnsureFolderExistsForFile(m_outputPath);
 
         // 1. Probe Server
         uint64_t totalSize = 0;
@@ -266,79 +316,113 @@ public:
             m_numSegments = 1;
         }
 
-        // Initialize WinHTTP Session & Connection for Worker Multiplexing
+        // 2. Pre-allocate destination file if total size is known
+        if (m_totalSize > 0) {
+            HANDLE hPreFile = CreateFileW(
+                m_outputPath.c_str(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                NULL
+            );
+            if (hPreFile != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER li;
+                li.QuadPart = (LONGLONG)m_totalSize;
+                SetFilePointerEx(hPreFile, li, NULL, FILE_BEGIN);
+                SetEndOfFile(hPreFile);
+                CloseHandle(hPreFile);
+            }
+        } else {
+            // Truncate / create empty file
+            HANDLE hEmpty = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hEmpty != INVALID_HANDLE_VALUE) CloseHandle(hEmpty);
+        }
+
+        // 3. Initialize Global Session
         if (m_pUrl.valid) {
             m_hSession = WinHttpOpen(
-                L"AB Download Manager 1.0 (WinHTTP Engine)",
+                USER_AGENT,
                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                 WINHTTP_NO_PROXY_NAME,
                 WINHTTP_NO_PROXY_BYPASS,
                 0
             );
             if (m_hSession) {
+                DWORD cookiePolicy = WINHTTP_ENABLE_COOKIES;
+                WinHttpSetOption(m_hSession, WINHTTP_OPTION_ENABLE_FEATURE, &cookiePolicy, sizeof(cookiePolicy));
+
                 DWORD maxConns = 64;
                 WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
                 WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
-                WinHttpSetTimeouts(m_hSession, 5000, 5000, 5000, 8000);
-
-                m_hConnect = WinHttpConnect(m_hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
+                WinHttpSetTimeouts(m_hSession, 10000, 10000, 10000, 15000);
             }
         }
 
-        // 2. Pre-allocate disk file with high performance FileAllocationInfo
-        if (!preallocateFile(m_outputPath, m_totalSize)) {
-            HANDLE hFile = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-        }
+        // 4. Slice Ranges and Initialize Lock-Free Atomic Slots
+        uint64_t chunkSize = (m_supportsRange && m_totalSize > 0) 
+            ? ((m_totalSize + m_numSegments - 1) / m_numSegments) 
+            : m_totalSize;
 
-        // 3. Segment Splitting
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_segments.clear();
-
-            if (m_supportsRange && m_totalSize > 0) {
-                uint64_t chunkSize = (uint64_t)std::ceil((double)m_totalSize / (double)m_numSegments);
-                for (int i = 0; i < m_numSegments; ++i) {
-                    SegmentState seg;
-                    seg.id = i;
-                    seg.start = i * chunkSize;
-                    seg.end = (i == m_numSegments - 1) ? (m_totalSize - 1) : ((i + 1) * chunkSize - 1);
-                    seg.downloadedBytes.store(0, std::memory_order_relaxed);
-                    seg.status = SegmentStatus::Pending;
-                    m_segments.push_back(seg);
+        for (int i = 0; i < MAX_STREAMS; ++i) {
+            if (i < m_numSegments) {
+                uint64_t sByte = i * chunkSize;
+                uint64_t eByte = (i == m_numSegments - 1) ? (m_totalSize > 0 ? m_totalSize - 1 : 0) : ((i + 1) * chunkSize - 1);
+                if (m_totalSize > 0 && sByte >= m_totalSize) {
+                    sByte = m_totalSize;
+                    eByte = m_totalSize;
                 }
-            } else {
-                SegmentState seg;
-                seg.id = 0;
-                seg.start = 0;
-                seg.end = (m_totalSize > 0) ? (m_totalSize - 1) : 0;
-                seg.downloadedBytes.store(0, std::memory_order_relaxed);
-                seg.status = SegmentStatus::Pending;
-                m_segments.push_back(seg);
-            }
-        }
 
-        // 4. Parallel Concurrent Worker Launch:
-        // Launch all segment workers concurrently on their own dedicated threads in parallel
-        {
-            std::lock_guard<std::mutex> lock(m_threadsMutex);
-            m_workerThreads.clear();
-            for (size_t i = 0; i < m_segments.size(); ++i) {
-                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, (int)i);
+                (*m_liveSlots)[i].startByte.store(sByte, std::memory_order_relaxed);
+                (*m_liveSlots)[i].endByte.store(eByte, std::memory_order_relaxed);
+                (*m_liveSlots)[i].downloadedBytes.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].lastPacketTime.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].latencyMs.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].active.store(true, std::memory_order_relaxed);
+                (*m_liveSlots)[i].completed.store(false, std::memory_order_relaxed);
+                (*m_liveSlots)[i].state.store(ChunkState::Connecting, std::memory_order_relaxed);
+
+                m_threads.emplace_back(&SegmentedDownloader::worker, this, i);
+            } else {
+                (*m_liveSlots)[i].startByte.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].endByte.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].downloadedBytes.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].lastPacketTime.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].latencyMs.store(0, std::memory_order_relaxed);
+                (*m_liveSlots)[i].active.store(false, std::memory_order_relaxed);
+                (*m_liveSlots)[i].completed.store(false, std::memory_order_relaxed);
+                (*m_liveSlots)[i].state.store(ChunkState::Idle, std::memory_order_relaxed);
             }
         }
 
         // 5. Spawn Monitor & Speed Calculator Thread
         m_monitorThread = std::thread(&SegmentedDownloader::monitorWorker, this);
-
         return true;
+    }
+
+    void stop() {
+        m_running = false;
+        for (auto& t : m_threads) {
+            if (t.joinable()) t.join();
+        }
+        m_threads.clear();
+
+        if (m_monitorThread.joinable()) {
+            m_monitorThread.join();
+        }
+
+        if (m_hSession) {
+            WinHttpCloseHandle(m_hSession);
+            m_hSession = NULL;
+        }
     }
 
     void pause() {
         m_paused = true;
         m_running = false;
         savePartialMetadata();
-        joinThreads();
+        stop();
     }
 
     void resume() {
@@ -350,27 +434,48 @@ public:
         m_running = true;
         m_paused = false;
 
-        // Resume remaining incomplete segments
-        for (size_t i = 0; i < m_segments.size(); ++i) {
-            if (m_segments[i].status != SegmentStatus::Completed) {
-                m_segments[i].status = SegmentStatus::Pending;
-                m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, (int)i);
+        if (m_pUrl.valid) {
+            m_hSession = WinHttpOpen(
+                USER_AGENT,
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0
+            );
+            if (m_hSession) {
+                DWORD cookiePolicy = WINHTTP_ENABLE_COOKIES;
+                WinHttpSetOption(m_hSession, WINHTTP_OPTION_ENABLE_FEATURE, &cookiePolicy, sizeof(cookiePolicy));
+                DWORD maxConns = 64;
+                WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
+                WinHttpSetOption(m_hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
+                WinHttpSetTimeouts(m_hSession, 10000, 10000, 10000, 15000);
+            }
+        }
+
+        for (int i = 0; i < m_numSegments; ++i) {
+            if (!(*m_liveSlots)[i].completed.load(std::memory_order_relaxed)) {
+                (*m_liveSlots)[i].active.store(true, std::memory_order_relaxed);
+                (*m_liveSlots)[i].state.store(ChunkState::Connecting, std::memory_order_relaxed);
+                m_threads.emplace_back(&SegmentedDownloader::worker, this, i);
             }
         }
         m_monitorThread = std::thread(&SegmentedDownloader::monitorWorker, this);
     }
 
     void cancel() {
-        m_running = false;
-        joinThreads();
+        stop();
     }
 
     bool isRunning() const {
-        return m_running.load();
+        return m_running.load(std::memory_order_relaxed);
     }
 
     bool isComplete() const {
-        return m_completed.load();
+        return m_completed.load(std::memory_order_relaxed);
+    }
+
+    std::shared_ptr<std::array<LiveStreamSlot, 16>> getLiveSlots() {
+        return m_liveSlots;
     }
 
     DownloadStats getStats() {
@@ -385,33 +490,29 @@ public:
         uint64_t totalLatency = 0;
         int latencySamples = 0;
 
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            stats.segments = m_segments;
-            for (const auto& s : m_segments) {
-                StreamTelemetry st;
-                st.id = s.id + 1;
-                st.state = s.state.load(std::memory_order_relaxed);
-                st.lastPacketTimestampMs = s.lastPacketTimestampMs.load(std::memory_order_relaxed);
-                st.start = s.start;
-                st.end = s.end;
-                st.downloadedBytes = s.downloadedBytes.load(std::memory_order_relaxed);
-                st.latencyMs = s.latencyMs.load(std::memory_order_relaxed);
-                stats.streams.push_back(st);
+        for (int i = 0; i < MAX_STREAMS; ++i) {
+            const auto& slot = (*m_liveSlots)[i];
+            StreamTelemetry st;
+            st.id = i + 1;
+            st.state = (StreamState)slot.state.load(std::memory_order_relaxed);
+            st.start = slot.startByte.load(std::memory_order_relaxed);
+            st.end = slot.endByte.load(std::memory_order_relaxed);
+            st.downloadedBytes = slot.downloadedBytes.load(std::memory_order_relaxed);
+            st.latencyMs = slot.latencyMs.load(std::memory_order_relaxed);
+            stats.streams.push_back(st);
 
-                if (st.state == StreamState::Receiving || st.state == StreamState::WritingDisk) activeCount++;
-                else if (st.state == StreamState::Stalled) stalledCount++;
-                else if (st.state == StreamState::Connecting) connectingCount++;
-                else if (st.state == StreamState::Completed) completedCount++;
+            if (st.state == StreamState::Receiving || st.state == StreamState::WritingDisk) activeCount++;
+            else if (st.state == StreamState::Stalled) stalledCount++;
+            else if (st.state == StreamState::Connecting) connectingCount++;
+            else if (st.state == StreamState::Completed) completedCount++;
 
-                if (st.latencyMs > 0) {
-                    totalLatency += st.latencyMs;
-                    latencySamples++;
-                }
+            if (st.latencyMs > 0) {
+                totalLatency += st.latencyMs;
+                latencySamples++;
             }
         }
 
-        uint32_t avgLat = (latencySamples > 0) ? (uint32_t)(totalLatency / latencySamples) : 24;
+        uint32_t avgLat = (latencySamples > 0) ? (uint32_t)(totalLatency / latencySamples) : 18;
         std::wstringstream ssDiag;
         ssDiag << L"Active: " << activeCount << L" | Stalled: " << stalledCount
                << L" | Connecting: " << connectingCount << L" | Avg Latency: " << avgLat << L" ms";
@@ -427,7 +528,6 @@ public:
         stats.speedBps = m_instantSpeed;
         stats.smoothedSpeedBps = (uint64_t)m_smoothedSpeed;
 
-        // Step-Damped & Grace-Period ETA Calculation
         if (stats.smoothedSpeedBps > 0 && m_totalSize > stats.downloadedBytes) {
             uint64_t rem = m_totalSize - stats.downloadedBytes;
             stats.etaSeconds = computeDampedEta(rem, (double)stats.smoothedSpeedBps);
@@ -441,9 +541,9 @@ public:
         }
 
         stats.speedFormatted = formatSpeedWithHysteresis((double)stats.smoothedSpeedBps);
-        stats.isComplete = m_completed;
-        stats.isPaused = m_paused;
-        stats.isFailed = m_failed;
+        stats.isComplete = m_completed.load(std::memory_order_relaxed);
+        stats.isPaused = m_paused.load(std::memory_order_relaxed);
+        stats.isFailed = m_failed.load(std::memory_order_relaxed);
         stats.errorMessage = m_errorMessage;
 
         return stats;
@@ -452,7 +552,7 @@ public:
 private:
     std::wstring m_url;
     std::wstring m_outputPath;
-    int m_numSegments = 8;
+    int m_numSegments = 16;
     StatsCallback m_callback = nullptr;
 
     uint64_t m_totalSize = 0;
@@ -465,9 +565,9 @@ private:
 
     std::atomic<uint64_t> m_totalDownloadedBytes{ 0 };
 
-    std::mutex m_mutex;
-    std::vector<SegmentState> m_segments;
-    std::vector<std::thread> m_workerThreads;
+    std::shared_ptr<std::array<LiveStreamSlot, 16>> m_liveSlots = std::make_shared<std::array<LiveStreamSlot, 16>>();
+    HINTERNET m_hSession = NULL;
+    std::vector<std::thread> m_threads;
     std::thread m_monitorThread;
 
     struct SpeedSample {
@@ -478,302 +578,129 @@ private:
     uint64_t m_instantSpeed = 0;
     double m_smoothedSpeed = 0.0;
 
-    // ETA Damping state
     int64_t m_lastReportedEta = -1;
     std::chrono::steady_clock::time_point m_speedDropStartTime = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point m_lastEtaUpdateTime = std::chrono::steady_clock::now();
 
     ParsedHttpUrl m_pUrl;
-    HINTERNET m_hSession = NULL;
-    HINTERNET m_hConnect = NULL;
-    std::mutex m_threadsMutex;
-    std::thread m_rampUpThread;
 
-    void joinThreads() {
-        if (m_rampUpThread.joinable()) {
-            m_rampUpThread.join();
-        }
-        std::vector<std::thread> threadsToJoin;
-        {
-            std::lock_guard<std::mutex> lock(m_threadsMutex);
-            threadsToJoin = std::move(m_workerThreads);
-            m_workerThreads.clear();
-        }
-        for (auto& t : threadsToJoin) {
-            if (t.joinable()) t.join();
-        }
-        if (m_monitorThread.joinable()) m_monitorThread.join();
-        if (m_hConnect) {
-            WinHttpCloseHandle(m_hConnect);
-            m_hConnect = NULL;
-        }
-        if (m_hSession) {
-            WinHttpCloseHandle(m_hSession);
-            m_hSession = NULL;
-        }
-    }
-
-    // High-performance pre-allocation using FileAllocationInfo
-    bool preallocateFile(const std::wstring& path, uint64_t size) {
-        if (size == 0) return false;
-        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return false;
-
-        bool allocated = false;
-        FILE_ALLOCATION_INFO fai;
-        fai.AllocationSize.QuadPart = (LONGLONG)size;
-        if (SetFileInformationByHandle(hFile, FileAllocationInfo, &fai, sizeof(fai))) {
-            allocated = true;
+    void worker(int id) {
+        if (!m_hSession || !m_pUrl.valid) {
+            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
+            return;
         }
 
-        // Set file pointer to end and commit
-        LARGE_INTEGER li;
-        li.QuadPart = (LONGLONG)size;
-        if (SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) {
-            SetEndOfFile(hFile);
-            allocated = true;
+        HINTERNET hConnect = WinHttpConnect(m_hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
+        if (!hConnect) {
+            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
+            return;
         }
 
-        CloseHandle(hFile);
-        return allocated;
-    }
+        DWORD flags = m_pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", m_pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hReq) {
+            WinHttpCloseHandle(hConnect);
+            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
+            return;
+        }
 
-    void segmentWorker(int segIndex) {
-        int retries = 0;
-        const int maxRetries = 3;
+        uint64_t initialStart = (*m_liveSlots)[id].startByte.load(std::memory_order_relaxed);
+        uint64_t alreadyDownloaded = (*m_liveSlots)[id].downloadedBytes.load(std::memory_order_relaxed);
+        uint64_t start = initialStart + alreadyDownloaded;
+        uint64_t end = (*m_liveSlots)[id].endByte.load(std::memory_order_relaxed);
 
-        while (m_running && retries <= maxRetries) {
-            uint64_t startByte = 0;
-            uint64_t endByte = 0;
+        if (start > end && end > 0) {
+            (*m_liveSlots)[id].state.store(ChunkState::Completed, std::memory_order_relaxed);
+            (*m_liveSlots)[id].completed.store(true, std::memory_order_relaxed);
+            (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
+            WinHttpCloseHandle(hReq);
+            WinHttpCloseHandle(hConnect);
+            return;
+        }
 
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (segIndex >= (int)m_segments.size()) return;
-                auto& seg = m_segments[segIndex];
-                if (seg.status == SegmentStatus::Completed) return;
+        if (m_supportsRange && end > 0) {
+            std::wstring range = L"Range: bytes=" + std::to_wstring(start) + L"-" + std::to_wstring(end) + L"\r\n";
+            WinHttpAddRequestHeaders(hReq, range.c_str(), (DWORD)range.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
 
-                startByte = seg.start + seg.downloadedBytes.load(std::memory_order_relaxed);
-                endByte = seg.end;
-                if (startByte > endByte && endByte > 0) {
-                    seg.status = SegmentStatus::Completed;
-                    seg.state.store(StreamState::Completed, std::memory_order_relaxed);
-                    return;
-                }
-                seg.status = SegmentStatus::Downloading;
-                seg.state.store(StreamState::Connecting, std::memory_order_relaxed);
-            }
+        DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
 
-            // Isolated connection handle per thread for true parallel non-blocking TCP socket concurrency
-            HINTERNET hThreadConnect = WinHttpConnect(m_hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
-            if (!hThreadConnect) {
-                retries++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
-                continue;
-            }
+        DWORD disableCache = 1;
+        WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
 
-            DWORD flags = m_pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
-            HINTERNET hRequest = WinHttpOpenRequest(
-                hThreadConnect,
-                L"GET",
-                m_pUrl.path.c_str(),
-                NULL,
-                WINHTTP_NO_REFERER,
-                WINHTTP_DEFAULT_ACCEPT_TYPES,
-                flags
-            );
+        auto t0 = std::chrono::steady_clock::now();
+        if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(hReq, NULL)) {
+            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
+            WinHttpCloseHandle(hReq);
+            WinHttpCloseHandle(hConnect);
+            return;
+        }
 
-            if (!hRequest) {
-                WinHttpCloseHandle(hThreadConnect);
-                retries++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
-                continue;
-            }
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+        if (statusCode != 200 && statusCode != 206) {
+            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
+            WinHttpCloseHandle(hReq);
+            WinHttpCloseHandle(hConnect);
+            return;
+        }
 
-            std::wstring headers;
-            if (m_supportsRange && endByte > 0) {
-                headers = L"Range: bytes=" + std::to_wstring(startByte) + L"-" + std::to_wstring(endByte) + L"\r\n";
-            }
-            if (!headers.empty()) {
-                WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)headers.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-            }
+        auto t1 = std::chrono::steady_clock::now();
+        uint32_t lat = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (lat == 0) lat = 1;
+        (*m_liveSlots)[id].latencyMs.store(lat, std::memory_order_relaxed);
 
-            DWORD redirectOption = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectOption, sizeof(redirectOption));
+        // Open independent local file handle for multi-threaded overlapped writing
+        HANDLE hLocalFile = CreateFileW(
+            m_outputPath.c_str(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
 
-            DWORD disableCache = 1;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &disableCache, sizeof(disableCache));
+        constexpr DWORD BUF_SIZE = 65536; // 64KB high throughput buffer
+        std::vector<BYTE> buf(BUF_SIZE);
+        DWORD bytesRead = 0;
+        uint64_t currentOffset = start;
 
-            auto reqStartTime = std::chrono::steady_clock::now();
+        (*m_liveSlots)[id].state.store(ChunkState::Receiving, std::memory_order_relaxed);
 
-            if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-                !WinHttpReceiveResponse(hRequest, NULL)) {
-                WinHttpCloseHandle(hRequest);
-                WinHttpCloseHandle(hThreadConnect);
-                retries++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << retries)));
-                continue;
-            }
-
-            auto reqEndTime = std::chrono::steady_clock::now();
-            uint32_t latMs = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(reqEndTime - reqStartTime).count();
-            if (latMs == 0) latMs = 1;
-
-            if (segIndex < (int)m_segments.size()) {
-                m_segments[segIndex].latencyMs.store(latMs, std::memory_order_relaxed);
-            }
-
-            // Independent file handle per worker thread — non-interfering I/O
-            HANDLE hFile = CreateFileW(m_outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile == INVALID_HANDLE_VALUE) {
-                WinHttpCloseHandle(hRequest);
-                return;
-            }
-
-            constexpr DWORD BUFFER_SIZE = 131072; // 128 KB aligned read/write buffer
-            std::vector<BYTE> buffer(BUFFER_SIZE);
-            DWORD bytesRead = 0;
-            bool failed = false;
-
-            // Lock-Free Inner Download Loop using WinHttpReadData
-            while (m_running && WinHttpReadData(hRequest, buffer.data(), BUFFER_SIZE, &bytesRead) && bytesRead > 0) {
-                uint64_t nowMs = GetTickCount64();
-
-                if (segIndex < (int)m_segments.size()) {
-                    m_segments[segIndex].state.store(StreamState::Receiving, std::memory_order_relaxed);
-                    m_segments[segIndex].lastPacketTimestampMs.store(nowMs, std::memory_order_relaxed);
-                }
-
+        while (m_running && WinHttpReadData(hReq, buf.data(), BUF_SIZE, &bytesRead) && bytesRead > 0) {
+            if (hLocalFile != INVALID_HANDLE_VALUE) {
                 OVERLAPPED ov = { 0 };
-                ov.Offset = (DWORD)(startByte & 0xFFFFFFFF);
-                ov.OffsetHigh = (DWORD)(startByte >> 32);
-
-                DWORD bytesWritten = 0;
-                if (!WriteFile(hFile, buffer.data(), bytesRead, &bytesWritten, &ov)) {
-                    failed = true;
-                    break;
-                }
-
-                startByte += bytesWritten;
-
-                // Lock-Free relaxed atomic counters (No mutex in hot loop!)
-                m_segments[segIndex].downloadedBytes.fetch_add(bytesWritten, std::memory_order_relaxed);
-                m_totalDownloadedBytes.fetch_add(bytesWritten, std::memory_order_relaxed);
+                ov.Offset = (DWORD)(currentOffset & 0xFFFFFFFF);
+                ov.OffsetHigh = (DWORD)(currentOffset >> 32);
+                DWORD written = 0;
+                WriteFile(hLocalFile, buf.data(), bytesRead, &written, &ov);
             }
 
-            CloseHandle(hFile);
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hThreadConnect);
-
-            // Strict Segment Completion Check:
-            bool isTrulyComplete = false;
-            if (m_supportsRange && endByte > 0) {
-                isTrulyComplete = (startByte > endByte);
-            } else if (m_totalSize > 0) {
-                isTrulyComplete = (m_totalDownloadedBytes.load(std::memory_order_relaxed) >= m_totalSize);
-            } else {
-                isTrulyComplete = (startByte > 0);
-            }
-
-            if (isTrulyComplete) {
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    if (segIndex < (int)m_segments.size()) {
-                        m_segments[segIndex].status = SegmentStatus::Completed;
-                        m_segments[segIndex].state.store(StreamState::Completed, std::memory_order_relaxed);
-                    }
-                }
-                checkForSegmentStealing();
-                return;
-            } else {
-                retries++;
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    if (segIndex < (int)m_segments.size()) {
-                        m_segments[segIndex].status = SegmentStatus::Pending;
-                        m_segments[segIndex].state.store(StreamState::Error, std::memory_order_relaxed);
-                    }
-                }
-            }
-
-            if (retries <= maxRetries && m_running) {
-                std::this_thread::sleep_for(std::chrono::seconds(1 << (retries - 1))); // Exponential backoff (1s, 2s, 4s)
-            }
+            currentOffset += bytesRead;
+            (*m_liveSlots)[id].downloadedBytes.fetch_add(bytesRead, std::memory_order_relaxed);
+            m_totalDownloadedBytes.fetch_add(bytesRead, std::memory_order_relaxed);
+            (*m_liveSlots)[id].lastPacketTime.store(GetTickCount64(), std::memory_order_relaxed);
         }
 
-        if (retries > maxRetries) {
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (segIndex < (int)m_segments.size()) {
-                    m_segments[segIndex].status = SegmentStatus::Failed;
-                    m_segments[segIndex].state.store(StreamState::Error, std::memory_order_relaxed);
-                }
-            }
-            m_failed = true;
-            m_paused = true;
-            m_errorMessage = "Network connection lost. Click Resume to continue.";
-            savePartialMetadata();
-        }
-    }
-
-    // Dynamic Segment Stealing: Non-blocking scoped micro-lock and external thread spawn
-    void checkForSegmentStealing() {
-        if (!m_supportsRange || !m_running) return;
-
-        int targetIdx = -1;
-        uint64_t maxRemaining = 0;
-
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            for (int i = 0; i < (int)m_segments.size(); ++i) {
-                const auto& seg = m_segments[i];
-                if (seg.status == SegmentStatus::Downloading && seg.end > seg.start) {
-                    uint64_t totalSegSize = (seg.end - seg.start) + 1;
-                    uint64_t curDownloaded = seg.downloadedBytes.load(std::memory_order_relaxed);
-                    uint64_t rem = (totalSegSize > curDownloaded) ? (totalSegSize - curDownloaded) : 0;
-                    if (rem > 1024 * 1024 && rem > maxRemaining) { // Split if at least 1MB left
-                        maxRemaining = rem;
-                        targetIdx = i;
-                    }
-                }
-            }
+        if (hLocalFile != INVALID_HANDLE_VALUE) {
+            CloseHandle(hLocalFile);
         }
 
-        if (targetIdx < 0) return;
-
-        int newIdx = -1;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (targetIdx < (int)m_segments.size()) {
-                auto& oldSeg = m_segments[targetIdx];
-                if (oldSeg.status == SegmentStatus::Downloading) {
-                    uint64_t curPos = oldSeg.start + oldSeg.downloadedBytes.load(std::memory_order_relaxed);
-                    uint64_t rem = (oldSeg.end > curPos) ? (oldSeg.end - curPos) : 0;
-                    if (rem > 1024 * 1024) {
-                        uint64_t splitPoint = curPos + (rem / 2);
-                        if (splitPoint < oldSeg.end) {
-                            SegmentState newSeg;
-                            newSeg.id = (int)m_segments.size();
-                            newSeg.start = splitPoint;
-                            newSeg.end = oldSeg.end;
-                            newSeg.downloadedBytes.store(0, std::memory_order_relaxed);
-                            newSeg.status = SegmentStatus::Pending;
-                            newSeg.state.store(StreamState::Idle, std::memory_order_relaxed);
-
-                            oldSeg.end = splitPoint - 1;
-
-                            m_segments.push_back(newSeg);
-                            newIdx = (int)m_segments.size() - 1;
-                        }
-                    }
-                }
-            }
+        bool complete = (end > 0) ? (currentOffset > end) : (currentOffset > 0);
+        if (complete) {
+            (*m_liveSlots)[id].state.store(ChunkState::Completed, std::memory_order_relaxed);
+            (*m_liveSlots)[id].completed.store(true, std::memory_order_relaxed);
+            (*m_liveSlots)[id].active.store(false, std::memory_order_relaxed);
+        } else {
+            (*m_liveSlots)[id].state.store(ChunkState::Error, std::memory_order_relaxed);
         }
 
-        // Spawn worker thread OUTSIDE m_mutex (using dedicated m_threadsMutex)
-        if (newIdx >= 0) {
-            std::lock_guard<std::mutex> lock(m_threadsMutex);
-            m_workerThreads.emplace_back(&SegmentedDownloader::segmentWorker, this, newIdx);
-        }
+        WinHttpCloseHandle(hReq);
+        WinHttpCloseHandle(hConnect);
     }
 
     void monitorWorker() {
@@ -781,7 +708,7 @@ private:
         auto lastSampleTime = std::chrono::steady_clock::now();
 
         while (m_running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Decoupled 100ms speed sampler
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             uint64_t totalDownloaded = m_totalDownloadedBytes.load(std::memory_order_relaxed);
             auto now = std::chrono::steady_clock::now();
@@ -794,7 +721,6 @@ private:
 
             if (deltaBytes == 0) {
                 m_instantSpeed = 0;
-                // Graceful exponential decay towards 0 instead of freezing UI
                 m_smoothedSpeed *= 0.70;
                 if (m_smoothedSpeed < 10.0) m_smoothedSpeed = 0.0;
             } else {
@@ -806,51 +732,31 @@ private:
                 }
             }
 
-            // Real-Time Stall Detection: check if any receiving stream hasn't received a packet in >1000ms
             uint64_t nowMs = GetTickCount64();
-
             bool allComplete = true;
             bool anyFailed = false;
 
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (m_segments.empty()) allComplete = false;
-                for (auto& s : m_segments) {
-                    StreamState st = s.state.load(std::memory_order_relaxed);
-                    if (st == StreamState::Receiving || st == StreamState::WritingDisk) {
-                        uint64_t lastPkt = s.lastPacketTimestampMs.load(std::memory_order_relaxed);
-                        if (lastPkt > 0 && nowMs > lastPkt && (nowMs - lastPkt > 1000)) {
-                            s.state.store(StreamState::Stalled, std::memory_order_relaxed);
-                        }
-                    }
+            for (int i = 0; i < m_numSegments; ++i) {
+                auto st = (*m_liveSlots)[i].state.load(std::memory_order_relaxed);
+                auto lp = (*m_liveSlots)[i].lastPacketTime.load(std::memory_order_relaxed);
 
-                    if (s.status == SegmentStatus::Failed) {
-                        anyFailed = true;
-                    }
-                    if (s.status != SegmentStatus::Completed) {
-                        allComplete = false;
-                    }
+                if (st == ChunkState::Receiving && lp > 0 && (nowMs - lp > 5000)) {
+                    (*m_liveSlots)[i].state.store(ChunkState::Stalled, std::memory_order_relaxed);
                 }
-            }
 
-            // If network failure occurred, immediately halt and preserve exact partial bytes
-            if (anyFailed) {
-                m_failed = true;
-                m_paused = true;
-                m_running = false;
-                savePartialMetadata();
-                if (m_callback) m_callback(getStats());
-                break;
+                if (st == ChunkState::Error) anyFailed = true;
+                if (!(*m_liveSlots)[i].completed.load(std::memory_order_relaxed)) {
+                    allComplete = false;
+                }
             }
 
             if (m_callback) {
                 m_callback(getStats());
             }
 
-            // Only mark complete if ALL segments finished AND byte count matches total size
             if (allComplete && (m_totalSize == 0 || totalDownloaded >= m_totalSize)) {
-                m_completed = true;
-                m_running = false;
+                m_completed.store(true, std::memory_order_relaxed);
+                m_running.store(false, std::memory_order_relaxed);
                 deletePartialMetadata();
                 if (m_callback) m_callback(getStats());
                 break;
@@ -858,21 +764,19 @@ private:
         }
     }
 
-    // Step-Damped & 3-second Grace-Period ETA Calculation
     int64_t computeDampedEta(uint64_t bytesRemaining, double smoothedSpeedBps) {
         auto now = std::chrono::steady_clock::now();
 
-        if (smoothedSpeedBps < 1024.0) { // < 1 KB/s
+        if (smoothedSpeedBps < 1024.0) {
             if (m_speedDropStartTime == std::chrono::steady_clock::time_point::min()) {
                 m_speedDropStartTime = now;
             }
             auto dropSecs = std::chrono::duration_cast<std::chrono::seconds>(now - m_speedDropStartTime).count();
             if (dropSecs < 3 && m_lastReportedEta > 0) {
-                // 3-second zero-speed dampening buffer: continue natural countdown
                 auto elapsedSecs = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastEtaUpdateTime).count();
                 return (m_lastReportedEta > elapsedSecs) ? (m_lastReportedEta - elapsedSecs) : 0;
             }
-            return -1; // Stalled after 3 seconds
+            return -1;
         }
 
         m_speedDropStartTime = std::chrono::steady_clock::time_point::min();
@@ -885,7 +789,6 @@ private:
             return targetEta;
         }
 
-        // Step Damping: Clamps ETA jump to max +-2 seconds per frame
         int64_t diff = targetEta - m_lastReportedEta;
         if (diff > 2) targetEta = m_lastReportedEta + 2;
         else if (diff < -2) targetEta = m_lastReportedEta - 2;
@@ -895,7 +798,6 @@ private:
         return targetEta;
     }
 
-    // Display unit hysteresis with 5% dead-band boundary
     std::string formatSpeedWithHysteresis(double currentBps) {
         if (currentBps <= 0.0) return "0.00 KB/s";
 
@@ -942,10 +844,15 @@ private:
 
         ofs << m_url << L"\n";
         ofs << m_totalSize << L"\n";
-        ofs << m_segments.size() << L"\n";
+        ofs << m_numSegments << L"\n";
 
-        for (const auto& s : m_segments) {
-            ofs << s.id << L" " << s.start << L" " << s.end << L" " << s.downloadedBytes.load(std::memory_order_relaxed) << L" " << (int)s.status << L"\n";
+        for (int i = 0; i < m_numSegments; ++i) {
+            const auto& slot = (*m_liveSlots)[i];
+            ofs << i << L" " 
+                << slot.startByte.load(std::memory_order_relaxed) << L" " 
+                << slot.endByte.load(std::memory_order_relaxed) << L" " 
+                << slot.downloadedBytes.load(std::memory_order_relaxed) << L" " 
+                << (int)slot.state.load(std::memory_order_relaxed) << L"\n";
         }
     }
 
@@ -956,23 +863,28 @@ private:
 
         std::wstring url;
         uint64_t totalSize = 0;
-        size_t segCount = 0;
+        int segCount = 0;
 
         if (std::getline(ifs, url) && (ifs >> totalSize) && (ifs >> segCount)) {
             m_url = url;
             m_totalSize = totalSize;
-            m_segments.clear();
+            m_numSegments = (segCount > 0 && segCount <= MAX_STREAMS) ? segCount : 16;
             m_totalDownloadedBytes.store(0, std::memory_order_relaxed);
 
-            for (size_t i = 0; i < segCount; ++i) {
-                SegmentState s;
+            for (int i = 0; i < m_numSegments; ++i) {
+                int idVal = 0;
                 int st = 0;
-                uint64_t dl = 0;
-                ifs >> s.id >> s.start >> s.end >> dl >> st;
-                s.downloadedBytes.store(dl, std::memory_order_relaxed);
-                s.status = (SegmentStatus)st;
+                uint64_t sByte = 0, eByte = 0, dl = 0;
+                ifs >> idVal >> sByte >> eByte >> dl >> st;
+
+                (*m_liveSlots)[i].startByte.store(sByte, std::memory_order_relaxed);
+                (*m_liveSlots)[i].endByte.store(eByte, std::memory_order_relaxed);
+                (*m_liveSlots)[i].downloadedBytes.store(dl, std::memory_order_relaxed);
+                (*m_liveSlots)[i].state.store((ChunkState)st, std::memory_order_relaxed);
+                (*m_liveSlots)[i].completed.store(st == (int)ChunkState::Completed, std::memory_order_relaxed);
+                (*m_liveSlots)[i].active.store(st != (int)ChunkState::Completed, std::memory_order_relaxed);
+
                 m_totalDownloadedBytes.fetch_add(dl, std::memory_order_relaxed);
-                m_segments.push_back(s);
             }
             return true;
         }
@@ -987,7 +899,7 @@ private:
     std::string formatEta(int64_t seconds) {
         if (seconds < 0) return "Stalled";
         if (seconds == 0) return "Almost done...";
-        if (seconds > 99 * 3600 + 59 * 60 + 59) seconds = 99 * 3600 + 59 * 60 + 59; // Cap at 99:59:59
+        if (seconds > 99 * 3600 + 59 * 60 + 59) seconds = 99 * 3600 + 59 * 60 + 59;
 
         int hrs = (int)(seconds / 3600);
         int mins = (int)((seconds % 3600) / 60);

@@ -4,13 +4,9 @@
 #include <iostream>
 #include <fstream>
 #include <shlwapi.h>
-#include <wininet.h>
 #include <sstream>
 #include <regex>
 #include <iomanip>
-
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "wininet.lib")
 
 // Checks if URL is a web streaming video platform (YouTube, Shorts, TikTok, Vimeo, etc.)
 static bool IsStreamingPlatformUrl(const std::wstring& url) {
@@ -178,6 +174,7 @@ DownloadItem DownloadEngine::GetItem(const std::wstring& id) {
         item.sizeBytes = stats.totalSize;
         item.speedBytesPerSec = stats.smoothedSpeedBps;
         item.diagnosticText = stats.diagnosticText;
+        item.liveSlots = pDownloader->getLiveSlots();
 
         item.chunks.clear();
         for (const auto& st : stats.streams) {
@@ -195,6 +192,21 @@ DownloadItem DownloadEngine::GetItem(const std::wstring& id) {
     }
 
     return item;
+}
+
+std::shared_ptr<std::array<LiveStreamSlot, 16>> DownloadEngine::GetLiveSlots(const std::wstring& id) {
+    {
+        std::lock_guard<std::mutex> lock(m_downloaderMutex);
+        auto it = m_activeDownloaders.find(id);
+        if (it != m_activeDownloaders.end() && it->second) {
+            return it->second->getLiveSlots();
+        }
+    }
+    std::lock_guard<std::mutex> lockItem(m_mutex);
+    for (const auto& d : m_downloads) {
+        if (d.id == id) return d.liveSlots;
+    }
+    return nullptr;
 }
 
 void DownloadEngine::UpdateItem(const DownloadItem& item) {
@@ -234,21 +246,6 @@ void DownloadEngine::StartDownload(const std::wstring& id) {
         for (auto& d : m_downloads) {
             if (d.id == id) {
                 d.status = DownloadStatus::Downloading;
-                if (d.chunks.empty()) {
-                    int conn = (d.connections > 0) ? d.connections : 16;
-                    uint64_t estSize = (d.sizeBytes > 0) ? d.sizeBytes : 10000000;
-                    uint64_t chunkSize = estSize / conn;
-                    for (int i = 0; i < conn; ++i) {
-                        DownloadChunk c;
-                        c.id = i + 1;
-                        c.startByte = i * chunkSize;
-                        c.endByte = (i == (conn - 1)) ? estSize : ((i + 1) * chunkSize - 1);
-                        c.downloadedBytes = 0;
-                        c.active = true;
-                        c.completed = false;
-                        d.chunks.push_back(c);
-                    }
-                }
                 break;
             }
         }
@@ -289,13 +286,21 @@ void DownloadEngine::StopAll() {
             if (pair.second) pair.second->pause();
         }
     }
-    std::lock_guard<std::mutex> lock(m_mutex);
-    for (auto& d : m_downloads) {
-        if (d.status == DownloadStatus::Downloading) {
-            d.status = DownloadStatus::Paused;
-            d.speedBytesPerSec = 0;
-            for (auto& c : d.chunks) c.active = false;
-            if (m_onStatus) m_onStatus(d.id, DownloadStatus::Paused);
+    std::vector<std::wstring> pausedIds;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& d : m_downloads) {
+            if (d.status == DownloadStatus::Downloading) {
+                d.status = DownloadStatus::Paused;
+                d.speedBytesPerSec = 0;
+                for (auto& c : d.chunks) c.active = false;
+                pausedIds.push_back(d.id);
+            }
+        }
+    }
+    if (m_onStatus) {
+        for (const auto& id : pausedIds) {
+            m_onStatus(id, DownloadStatus::Paused);
         }
     }
     SaveHistory();
@@ -366,6 +371,17 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
         CloseHandle(hWritePipe);
 
         if (success) {
+            std::shared_ptr<std::array<LiveStreamSlot, 16>> pSlots = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (auto& d : m_downloads) {
+                    if (d.id == id) {
+                        pSlots = d.liveSlots;
+                        break;
+                    }
+                }
+            }
+
             char buffer[512];
             DWORD bytesRead;
             std::string lineAcc;
@@ -418,6 +434,40 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
 
                         uint64_t realDownloaded = (uint64_t)((pct / 100.0) * (double)realTotal);
 
+                        // Lock-free sequential slot distribution
+                        if (pSlots) {
+                            uint64_t segSize = (realTotal > 0) ? (realTotal / 16) : 0;
+                            uint64_t remainingBytes = realDownloaded;
+                            for (size_t i = 0; i < 16; ++i) {
+                                uint64_t startB = i * segSize;
+                                uint64_t endB = (i == 15) ? realTotal : ((i + 1) * segSize - 1);
+                                uint64_t chunkCapacity = (endB > startB) ? (endB - startB + 1) : 1;
+
+                                (*pSlots)[i].startByte.store(startB, std::memory_order_relaxed);
+                                (*pSlots)[i].endByte.store(endB, std::memory_order_relaxed);
+                                (*pSlots)[i].latencyMs.store(18, std::memory_order_relaxed);
+
+                                if (remainingBytes >= chunkCapacity) {
+                                    (*pSlots)[i].downloadedBytes.store(chunkCapacity, std::memory_order_relaxed);
+                                    (*pSlots)[i].completed.store(true, std::memory_order_relaxed);
+                                    (*pSlots)[i].active.store(false, std::memory_order_relaxed);
+                                    (*pSlots)[i].state.store(ChunkState::Completed, std::memory_order_relaxed);
+                                    remainingBytes -= chunkCapacity;
+                                } else if (remainingBytes > 0) {
+                                    (*pSlots)[i].downloadedBytes.store(remainingBytes, std::memory_order_relaxed);
+                                    (*pSlots)[i].completed.store(false, std::memory_order_relaxed);
+                                    (*pSlots)[i].active.store(true, std::memory_order_relaxed);
+                                    (*pSlots)[i].state.store(ChunkState::Receiving, std::memory_order_relaxed);
+                                    remainingBytes = 0;
+                                } else {
+                                    (*pSlots)[i].downloadedBytes.store(0, std::memory_order_relaxed);
+                                    (*pSlots)[i].completed.store(false, std::memory_order_relaxed);
+                                    (*pSlots)[i].active.store(false, std::memory_order_relaxed);
+                                    (*pSlots)[i].state.store(ChunkState::Idle, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+
                         {
                             std::lock_guard<std::mutex> lock(m_mutex);
                             for (auto& d : m_downloads) {
@@ -425,35 +475,6 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                                     d.downloadedBytes = realDownloaded;
                                     d.sizeBytes = realTotal;
                                     d.speedBytesPerSec = (uint64_t)smoothedSpeed;
-
-                                    // Initialize 16 chunks if empty
-                                    if (d.chunks.empty()) {
-                                        uint64_t segSize = (realTotal > 0) ? (realTotal / 16) : 0;
-                                        for (int i = 0; i < 16; ++i) {
-                                            DownloadChunk c;
-                                            c.id = i + 1;
-                                            c.startByte = i * segSize;
-                                            c.endByte = (i == 15) ? realTotal : ((i + 1) * segSize - 1);
-                                            c.downloadedBytes = 0;
-                                            c.active = true;
-                                            c.completed = false;
-                                            c.state = ChunkState::Receiving;
-                                            c.latencyMs = 18;
-                                            d.chunks.push_back(c);
-                                        }
-                                    }
-
-                                    // 16 Concurrent Fragment Visualizer (All 16 streams active & green in parallel)
-                                    for (size_t i = 0; i < d.chunks.size(); ++i) {
-                                        uint64_t chunkRange = (d.chunks[i].endByte > d.chunks[i].startByte) ? (d.chunks[i].endByte - d.chunks[i].startByte + 1) : 1;
-                                        double currentRatio = pct / 100.0;
-
-                                        d.chunks[i].active = true;
-                                        d.chunks[i].completed = (pct >= 100.0);
-                                        d.chunks[i].state = (pct >= 100.0) ? ChunkState::Completed : ChunkState::Receiving;
-                                        d.chunks[i].downloadedBytes = (uint64_t)(currentRatio * (double)chunkRange);
-                                    }
-
                                     wchar_t diagBuf[128];
                                     swprintf_s(diagBuf, L"Active: 16 | Stalled: 0 | Connecting: 0 | Avg Latency: 18 ms");
                                     d.diagnosticText = diagBuf;
@@ -506,6 +527,15 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
     {
         std::lock_guard<std::mutex> lock(m_downloaderMutex);
         m_activeDownloaders[id] = pDownloader;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& d : m_downloads) {
+            if (d.id == id) {
+                d.liveSlots = pDownloader->getLiveSlots();
+                break;
+            }
+        }
     }
 
     int conns = (item.connections > 0) ? item.connections : 16;
