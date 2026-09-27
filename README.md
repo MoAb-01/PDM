@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="docs/assets/app_icon.png" alt="Download Manager AB Icon" width="128" height="128" />
-  <h1>Download Manager AB (PDM)</h1>
+  <img src="docs/assets/app_icon.png" alt="PDM Icon" width="128" height="128" />
+  <h1>PDM</h1>
   <p><strong>Next-Gen High-Performance C++20 Multithreaded Download Accelerator & Media Sniffer</strong></p>
 
   [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg?style=flat&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
@@ -12,43 +12,43 @@
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
-- [System Architecture](#-system-architecture)
+- [System Architecture](#system-architecture)
   - [High-Level Architecture Diagram](#high-level-architecture-diagram)
   - [Core Components Breakdown](#core-components-breakdown)
-- [Download Engine & Acceleration Algorithms](#-download-engine--acceleration-algorithms)
+- [Download Engine & Acceleration Algorithms](#download-engine--acceleration-algorithms)
   - [Dynamic Segment Slicing & Multi-Threading](#dynamic-segment-slicing--multi-threading)
   - [Segment Stealing & Dynamic Rebalancing](#segment-stealing--dynamic-rebalancing)
   - [Chunk Assembly & Zero-Corruption Merging](#chunk-assembly--zero-corruption-merging)
   - [Direct I/O Buffering & Memory Management](#direct-io-buffering--memory-management)
-- [Edge Cases & Fault Tolerance](#-edge-cases--fault-tolerance)
+- [Edge Cases & Fault Tolerance](#edge-cases--fault-tolerance)
   - [Byte-Range Header Quirks & Server Caveats](#byte-range-header-quirks--server-caveats)
   - [Dynamic & Session-Expiring URLs](#dynamic--session-expiring-urls)
   - [Disk Space Pre-Allocation & Low-Disk Protection](#disk-space-pre-allocation--low-disk-protection)
   - [Stall Detection & Auto-Reconnection](#stall-detection--auto-reconnection)
   - [Path Sanitization & UTF-8 / UTF-16 Conversion](#path-sanitization--utf-8--utf-16-conversion)
   - [Graceful Shutdown & State Persistence](#graceful-shutdown--state-persistence)
-- [Media Sniffing & Stream Pipeline](#-media-sniffing--stream-pipeline)
+- [Media Sniffing & Stream Pipeline](#media-sniffing--stream-pipeline)
   - [Browser Companion Extension (Manifest V3)](#browser-companion-extension-manifest-v3)
   - [Native Messaging Protocol & Local HTTP Bridge](#native-messaging-protocol--local-http-bridge)
   - [Stream Extraction, yt-dlp & FFmpeg Muxing](#stream-extraction-yt-dlp--ffmpeg-muxing)
-- [UI & UX Design Systems](#-ui--ux-design-systems)
+- [UI & UX Design Systems](#ui--ux-design-systems)
   - [Native Win32 Dark Mode Desktop UI](#native-win32-dark-mode-desktop-ui)
   - [Live Chunk Visualizer](#live-chunk-visualizer)
   - [Interactive React + Vite Dashboard](#interactive-react--vite-dashboard)
-- [Project Directory Structure](#-project-directory-structure)
-- [Build & Installation Guide](#-build--installation-guide)
+- [Project Directory Structure](#project-directory-structure)
+- [Build & Installation Guide](#build--installation-guide)
   - [Prerequisites](#prerequisites)
   - [Building Native Windows Binary (C++20)](#building-native-windows-binary-c20)
   - [Setting Up Browser Extension & Native Host](#setting-up-browser-extension--native-host)
   - [Running the React Web Interface](#running-the-react-web-interface)
-- [Configuration & Settings](#-configuration--settings)
-- [Contributing & License](#-contributing--license)
+- [Configuration & Settings](#configuration--settings)
+- [Contributing & License](#contributing--license)
 
 ---
 
-## 🏛 System Architecture
+## System Architecture
 
 The project employs a dual-tier hybrid architecture: a low-overhead, native high-performance C++20 desktop engine and an optional React web UI, coordinated through browser extensions and native IPC.
 
@@ -64,7 +64,7 @@ flowchart TB
         EXT -->|REST / HTTP 127.0.0.1:9898| SRV
     end
 
-    subgraph NativeApp ["Native C++20 Core Application (DownloadManagerAB.exe)"]
+    subgraph NativeApp ["Native C++20 Core Application (PDM.exe)"]
         NATHOS -->|Process Launch / Named Pipes / IPC| MAINWIN
         SRV["LocalServerBridge (HTTP Daemon)"]
         MAINWIN["MainWindow (Win32 Custom Dark / Direct2D / DWM)"]
@@ -98,7 +98,7 @@ flowchart TB
 
 ### Core Components Breakdown
 
-1. **Native C++ Engine (`DownloadManagerAB.exe`)**:
+1. **Native C++ Engine (`PDM.exe`)**:
    - Built on standard Win32, C++20, and `WinHTTP` APIs.
    - Zero bulky framework overhead (no Electron, no Qt runtimes).
    - Manages multithreaded chunk downloads, byte-level file serialization, real-time speed smoothing, queuing, and download persistence.
@@ -116,7 +116,7 @@ flowchart TB
 
 ---
 
-## ⚡ Download Engine & Acceleration Algorithms
+## Download Engine & Acceleration Algorithms
 
 ### Dynamic Segment Slicing & Multi-Threading
 
@@ -156,9 +156,9 @@ The engine supports two primary file writing modes:
 
 ---
 
-## 🛡️ Edge Cases & Fault Tolerance
+## Edge Cases & Fault Tolerance
 
-Industrial download managers must survive unpredictable real-world internet and file-system failures. Here is how Download Manager AB handles edge cases:
+Industrial download managers must survive unpredictable real-world internet and file-system failures. Here is how PDM handles edge cases:
 
 | Scenario | Challenge | Architectural Resolution |
 | :--- | :--- | :--- |
@@ -172,9 +172,9 @@ Industrial download managers must survive unpredictable real-world internet and 
 
 ---
 
-## 🎥 Media Sniffing & Stream Pipeline
+## Media Sniffing & Stream Pipeline
 
-Download Manager AB features an integrated media interceptor capable of extracting and downloading streaming media from modern web platforms.
+PDM features an integrated media interceptor capable of extracting and downloading streaming media from modern web platforms.
 
 ### Browser Companion Extension (Manifest V3)
 
@@ -216,7 +216,7 @@ For complex platforms with separated adaptive video and audio streams (such as Y
 
 ---
 
-## 🎨 UI & UX Design Systems
+## UI & UX Design Systems
 
 ### Native Win32 Dark Mode Desktop UI
 
@@ -234,10 +234,10 @@ The native desktop interface is engineered in pure C++20 with custom Win32 messa
 
 The **Chunk Visualizer** provides a real-time graphic representation of how files are fetched across all threads:
 - **Connection Segments**: Color-coded segments representing connection statuses:
-  - 🟢 **Receiving**: Active inbound payload.
-  - 🟡 **Connecting / Stalled**: Establishing socket handshake or waiting on packets.
-  - 🔵 **Writing to Disk**: Buffering payload to disk file.
-  - 🟣 **Completed**: Downloaded and verified.
+  - Receiving: Active inbound payload.
+  - Connecting / Stalled: Establishing socket handshake or waiting on packets.
+  - Writing to Disk: Buffering payload to disk file.
+  - Completed: Downloaded and verified.
 - **Interactive Metrics**: Shows latency in milliseconds, per-connection transfer rate, and current read/write offsets.
 
 <div align="center">
@@ -259,10 +259,10 @@ For remote control or modern browser-based management, a companion React 19 dash
 
 ---
 
-## 📁 Project Directory Structure
+## Project Directory Structure
 
 ```plaintext
-Download-Manager-AB/
+PDM/
 ├── cpp/                                # Core Native C++ Engine
 │   ├── CMakeLists.txt                  # CMake build configuration (C++20)
 │   ├── build.bat                       # Automated MSVC / CMake compile script
@@ -300,7 +300,7 @@ Download-Manager-AB/
 
 ---
 
-## 🛠 Build & Installation Guide
+## Build & Installation Guide
 
 ### Prerequisites
 
@@ -327,7 +327,7 @@ Download-Manager-AB/
    cmake --build cpp/build --config Release
    ```
 4. The output binaries will be created in `cpp/build/Release/`:
-   - `DownloadManagerAB.exe` (Main Desktop App)
+   - `PDM.exe` (Main Desktop App)
    - `IDMNativeHost.exe` (Browser Native Host)
 
 ### Setting Up Browser Extension & Native Host
@@ -360,9 +360,9 @@ Open `http://localhost:5173` in your browser.
 
 ---
 
-## ⚙️ Configuration & Settings
+## Configuration & Settings
 
-Download Manager AB provides fine-grained control over network operations through its Options dialog:
+PDM provides fine-grained control over network operations through its Options dialog:
 
 - **Connection Limits**:
   - `Default Connections per File`: 1 to 16 streams (default: 8).
@@ -376,7 +376,7 @@ Download Manager AB provides fine-grained control over network operations throug
 
 ---
 
-## 🤝 Contributing & License
+## Contributing & License
 
 Contributions, bug reports, and pull requests are welcome!
 
