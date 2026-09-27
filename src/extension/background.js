@@ -6,8 +6,7 @@ const MEDIA_MIME_PATTERNS = [
   "audio/",
   "application/x-mpegurl",
   "application/vnd.apple.mpegurl",
-  "application/dash+xml",
-  "application/octet-stream"
+  "application/dash+xml"
 ];
 
 const MEDIA_EXTENSIONS = [
@@ -136,8 +135,32 @@ let lastDownloadUrl = "";
 let lastDownloadTime = 0;
 
 async function resolveTabTitleIfMissing(stream) {
-  if (stream.filename && stream.filename !== "watch" && stream.filename !== "download.bin" && stream.filename !== "video") {
-    return stream.filename;
+  const isAudio = (stream.quality && (stream.quality.includes("Audio") || stream.quality.includes("MP3") || stream.quality.includes("M4A"))) ||
+                  (stream.mimeType && stream.mimeType.includes("audio"));
+  const audioExt = (stream.quality && stream.quality.includes("M4A")) ? ".m4a" : ".mp3";
+  const defaultExt = isAudio ? audioExt : ".mp4";
+
+  // Check URL query parameters first (e.g. ?path=/mnt/user-data/outputs/design.md, ?filename=, ?file=)
+  if (stream.url) {
+    try {
+      const parsedUrl = new URL(stream.url);
+      const queryParam = parsedUrl.searchParams.get("path") || parsedUrl.searchParams.get("filename") || parsedUrl.searchParams.get("file");
+      if (queryParam) {
+        const decoded = decodeURIComponent(queryParam);
+        const base = decoded.split("/").pop().split("\\").pop();
+        if (base && base.includes(".")) {
+          return base;
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (stream.filename && stream.filename !== "watch" && stream.filename !== "download.bin" && stream.filename !== "video" && stream.filename !== "download-file") {
+    let fn = stream.filename;
+    if (isAudio && fn.toLowerCase().endsWith(".mp4")) {
+      fn = fn.substring(0, fn.length - 4) + defaultExt;
+    }
+    return fn;
   }
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -153,7 +176,7 @@ async function resolveTabTitleIfMissing(stream) {
       let clean = t.replace(/[\/\\:*?"<>|]/g, " ").replace(/\s+/g, " ").trim();
       if (clean.length > 120) clean = clean.substring(0, 120).trim();
       if (clean && clean.length > 2) {
-        return clean + ".mp4";
+        return clean + defaultExt;
       }
     }
   } catch (e) {}
@@ -166,6 +189,8 @@ function isCloudflareOrProtected(url) {
   return (
     u.includes("overleaf.com") ||
     u.includes("/download/project/") ||
+    u.includes("claude.ai") ||
+    u.includes("/wiggle/download-file") ||
     u.includes("cloudflare") ||
     u.includes("challenges.cloudflare.com") ||
     u.includes("cf-browser-verification")
@@ -185,7 +210,7 @@ function getCategoryFolderForFilename(filename, mimeType) {
   if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"].includes(ext) || (mimeType && (mimeType.includes("zip") || mimeType.includes("compressed") || mimeType.includes("archive")))) {
     return "Compressed";
   }
-  if (["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "csv"].includes(ext) || (mimeType && (mimeType.includes("pdf") || mimeType.includes("document") || mimeType.includes("text")))) {
+  if (["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "csv", "md", "markdown", "json"].includes(ext) || (mimeType && (mimeType.includes("pdf") || mimeType.includes("document") || mimeType.includes("text")))) {
     return "Documents";
   }
   if (["exe", "msi", "bat", "cmd", "apk", "dmg", "pkg"].includes(ext)) {
@@ -197,6 +222,12 @@ function getCategoryFolderForFilename(filename, mimeType) {
 // Centralized forward function (Primary: HTTP Bridge | Fallback: Native Messaging Host)
 async function forwardDownloadToIdmApp(stream) {
   if (!stream || !stream.url) return;
+
+  // In-memory Blob/Data URLs (WhatsApp Web, Telegram Web, Mega, etc.) are handled directly by the browser
+  if (stream.url.startsWith("blob:") || stream.url.startsWith("data:")) {
+    console.log("[IDM Extension] Skipping in-memory blob/data URL, handled by browser:", stream.filename);
+    return;
+  }
 
   const now = Date.now();
   if (stream.url === lastDownloadUrl && (now - lastDownloadTime) < 1500) {
@@ -249,7 +280,10 @@ async function forwardDownloadToIdmApp(stream) {
     mimeType: stream.mimeType || stream.mime || "",
     quality: stream.quality || "",
     cookies: cookieHeader,
-    userAgent: navigator.userAgent
+    userAgent: navigator.userAgent,
+    totalSize: (stream.totalSize && stream.totalSize > 0) ? stream.totalSize : ((stream.fileSize && stream.fileSize > 0) ? stream.fileSize : 0),
+    videoSize: stream.videoSize || 0,
+    audioSize: stream.audioSize || 0
   };
 
   // 1. Direct Local HTTP Bridge (Primary fast channel when IDM app is running)
@@ -308,6 +342,14 @@ if (chrome.downloads && chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
     if (!downloadItem || !downloadItem.url) return;
 
+    // For in-memory Blob/Data URLs (WhatsApp Web, Telegram Web, Mega client-side decryption):
+    // Allow the browser to save it directly from RAM in 0.01s with zero network friction.
+    if (downloadItem.url.startsWith("blob:") || downloadItem.url.startsWith("data:")) {
+      console.log("[IDM Extension] In-memory blob/data download detected (WhatsApp/Telegram), saving directly via browser:", downloadItem.filename);
+      suggest({ filename: downloadItem.filename || "download" });
+      return;
+    }
+
     console.log("[IDM Extension] Intercepted browser download:", downloadItem.url, "Filename:", downloadItem.filename);
 
     // Call suggest first
@@ -327,12 +369,17 @@ if (chrome.downloads && chrome.downloads.onDeterminingFilename) {
       }
     }, 200);
 
-    // Forward to C++ app with cookies, referer and userAgent
+    const totalBytes = (downloadItem.fileSize && downloadItem.fileSize > 0)
+      ? downloadItem.fileSize
+      : ((downloadItem.totalBytes && downloadItem.totalBytes > 0) ? downloadItem.totalBytes : 0);
+
+    // Forward to C++ app with cookies, referer, userAgent, and exact totalBytes
     forwardDownloadToIdmApp({
       url: downloadItem.url,
       filename: downloadItem.filename,
       referer: downloadItem.referrer || downloadItem.finalUrl || "",
-      mimeType: downloadItem.mime || ""
+      mimeType: downloadItem.mime || "",
+      totalSize: totalBytes
     });
     return true;
   });

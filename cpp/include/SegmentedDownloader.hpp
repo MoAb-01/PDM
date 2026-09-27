@@ -168,7 +168,7 @@ class SegmentedDownloader {
 public:
     using StatsCallback = std::function<void(const DownloadStats& stats)>;
     static constexpr int MAX_STREAMS = 16;
-    static constexpr const wchar_t* USER_AGENT = L"Wget/1.21.4 (win32) DownloadManagerAB/2.0";
+    static constexpr const wchar_t* USER_AGENT = L"Wget/1.21.4 (win32) PDMDownloadManager/2.0";
 
     SegmentedDownloader() = default;
     ~SegmentedDownloader() {
@@ -176,170 +176,164 @@ public:
     }
 
     bool probeUrl(const std::wstring& url, uint64_t& outSize, bool& outSupportsRange, std::wstring& outFileName) {
-        ParsedHttpUrl pUrl = CrackHttpUrl(url);
-        if (!pUrl.valid) return false;
+        m_url = url;
+        m_pUrl = CrackHttpUrl(url);
+        if (!m_pUrl.valid) return false;
 
-        HINTERNET hSession = WinHttpOpen(
-            USER_AGENT,
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0
-        );
-        if (!hSession) return false;
+        outSize = 0;
+        outSupportsRange = false;
 
-        DWORD maxConns = 64;
-        WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
-        WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
-        WinHttpSetTimeouts(hSession, 10000, 10000, 10000, 15000);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            HINTERNET hSession = WinHttpOpen(
+                (attempt == 0 && !m_customUserAgent.empty()) ? m_customUserAgent.c_str() : USER_AGENT,
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0
+            );
+            if (!hSession) continue;
 
-        HINTERNET hConn = WinHttpConnect(hSession, pUrl.host.c_str(), pUrl.port, 0);
-        if (!hConn) {
-            WinHttpCloseHandle(hSession);
-            return false;
-        }
+            DWORD maxConns = 64;
+            WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConns, sizeof(maxConns));
+            WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConns, sizeof(maxConns));
+            WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 7000);
 
-        DWORD flags = pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
-        HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-        if (!hReq) {
+            HINTERNET hConn = WinHttpConnect(hSession, m_pUrl.host.c_str(), m_pUrl.port, 0);
+            if (!hConn) {
+                WinHttpCloseHandle(hSession);
+                continue;
+            }
+
+            DWORD flags = m_pUrl.isHttps ? WINHTTP_FLAG_SECURE : 0;
+            HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", m_pUrl.path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+            if (!hReq) {
+                WinHttpCloseHandle(hConn);
+                WinHttpCloseHandle(hSession);
+                continue;
+            }
+
+            DWORD redir = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+            WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &redir, sizeof(redir));
+
+            DWORD noCache = 1;
+            WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &noCache, sizeof(noCache));
+
+            if (attempt == 0) {
+                bool isDynamicEndpoint = (url.find(L"overleaf.com") != std::wstring::npos ||
+                                          url.find(L"claude.ai") != std::wstring::npos ||
+                                          url.find(L"/download/zip") != std::wstring::npos ||
+                                          url.find(L"/wiggle/download-file") != std::wstring::npos);
+                if (!isDynamicEndpoint) {
+                    std::wstring rHdr = L"Range: bytes=0-0\r\n";
+                    WinHttpAddRequestHeaders(hReq, rHdr.c_str(), (DWORD)rHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+                }
+
+                if (!m_cookies.empty()) {
+                    std::wstring cookieHdr = L"Cookie: " + m_cookies + L"\r\n";
+                    WinHttpAddRequestHeaders(hReq, cookieHdr.c_str(), (DWORD)cookieHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+                }
+                if (!m_referer.empty()) {
+                    std::wstring refHdr = L"Referer: " + m_referer + L"\r\n";
+                    WinHttpAddRequestHeaders(hReq, refHdr.c_str(), (DWORD)refHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+                }
+                if (!m_customUserAgent.empty()) {
+                    std::wstring uaHdr = L"User-Agent: " + m_customUserAgent + L"\r\n";
+                    WinHttpAddRequestHeaders(hReq, uaHdr.c_str(), (DWORD)uaHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+                }
+            } else {
+                std::wstring uaHdr = L"User-Agent: " + std::wstring(USER_AGENT) + L"\r\n";
+                WinHttpAddRequestHeaders(hReq, uaHdr.c_str(), (DWORD)uaHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+
+            bool isOverleaf = (url.find(L"overleaf.com") != std::wstring::npos || url.find(L"claude.ai") != std::wstring::npos);
+            if (isOverleaf) {
+                std::wstring extraHdr =
+                    L"Sec-Fetch-Site: same-origin\r\n"
+                    L"Sec-Fetch-Mode: navigate\r\n"
+                    L"Sec-Fetch-Dest: document\r\n"
+                    L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                    L"Accept-Language: en-US,en;q=0.9\r\n";
+                WinHttpAddRequestHeaders(hReq, extraHdr.c_str(), (DWORD)extraHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            } else {
+                std::wstring acceptHdr = L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n";
+                WinHttpAddRequestHeaders(hReq, acceptHdr.c_str(), (DWORD)acceptHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+            }
+
+            if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(hReq, NULL)) {
+
+                // Resolve final redirected URL
+                DWORD finalUrlSize = 0;
+                WinHttpQueryOption(hReq, WINHTTP_OPTION_URL, NULL, &finalUrlSize);
+                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && finalUrlSize > 0) {
+                    std::vector<wchar_t> finalUrl(finalUrlSize / sizeof(wchar_t) + 1);
+                    if (WinHttpQueryOption(hReq, WINHTTP_OPTION_URL, finalUrl.data(), &finalUrlSize)) {
+                        std::wstring resolved = finalUrl.data();
+                        if (!resolved.empty()) {
+                            m_url = resolved;
+                            m_pUrl = CrackHttpUrl(resolved);
+                        }
+                    }
+                }
+
+                DWORD sc = 0, scSz = sizeof(sc);
+                WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scSz, WINHTTP_NO_HEADER_INDEX);
+                m_diagnosticText = L"HTTP Status: " + std::to_wstring(sc);
+
+                if ((sc == 403 || sc == 401) && attempt == 0) {
+                    WinHttpCloseHandle(hReq);
+                    WinHttpCloseHandle(hConn);
+                    WinHttpCloseHandle(hSession);
+                    continue;
+                }
+
+                outSupportsRange = false;
+                if (sc == 206) {
+                    outSupportsRange = true;
+                    wchar_t cr[256] = { 0 };
+                    DWORD crSz = sizeof(cr);
+                    if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX, cr, &crSz, WINHTTP_NO_HEADER_INDEX)) {
+                        std::wstring crStr = cr;
+                        size_t slash = crStr.find(L'/');
+                        if (slash != std::wstring::npos && slash + 1 < crStr.length()) {
+                            try { outSize = std::stoull(crStr.substr(slash + 1)); } catch (...) {}
+                        }
+                    }
+                } else if (sc == 200) {
+                    DWORD cl = 0, clSz = sizeof(cl);
+                    if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &cl, &clSz, WINHTTP_NO_HEADER_INDEX)) {
+                        outSize = cl;
+                    }
+                    wchar_t ar[64] = { 0 };
+                    DWORD arSz = sizeof(ar);
+                    if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, L"Accept-Ranges", ar, &arSz, WINHTTP_NO_HEADER_INDEX)) {
+                        if (std::wstring(ar).find(L"bytes") != std::wstring::npos && outSize > 0) {
+                            outSupportsRange = true;
+                        }
+                    }
+                }
+
+                // Drain small body
+                DWORD avail = 0;
+                WinHttpQueryDataAvailable(hReq, &avail);
+                if (avail > 0) {
+                    std::vector<BYTE> trash(avail);
+                    DWORD got = 0;
+                    WinHttpReadData(hReq, trash.data(), avail, &got);
+                }
+
+                WinHttpCloseHandle(hReq);
+                WinHttpCloseHandle(hConn);
+                WinHttpCloseHandle(hSession);
+                return (sc == 200 || sc == 206);
+            }
+
+            WinHttpCloseHandle(hReq);
             WinHttpCloseHandle(hConn);
             WinHttpCloseHandle(hSession);
-            return false;
         }
 
-        DWORD redir = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-        WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &redir, sizeof(redir));
-
-        DWORD noCache = 1;
-        WinHttpSetOption(hReq, WINHTTP_OPTION_DISABLE_FEATURE, &noCache, sizeof(noCache));
-
-        bool isDynamicEndpoint = (url.find(L"overleaf.com") != std::wstring::npos || url.find(L"/download/zip") != std::wstring::npos);
-        if (!isDynamicEndpoint) {
-            std::wstring rHdr = L"Range: bytes=0-0\r\n";
-            WinHttpAddRequestHeaders(hReq, rHdr.c_str(), (DWORD)rHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        }
-
-        if (!m_cookies.empty()) {
-            std::wstring cookieHdr = L"Cookie: " + m_cookies + L"\r\n";
-            WinHttpAddRequestHeaders(hReq, cookieHdr.c_str(), (DWORD)cookieHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        }
-        if (!m_referer.empty()) {
-            std::wstring refHdr = L"Referer: " + m_referer + L"\r\n";
-            WinHttpAddRequestHeaders(hReq, refHdr.c_str(), (DWORD)refHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        }
-        if (!m_customUserAgent.empty()) {
-            std::wstring uaHdr = L"User-Agent: " + m_customUserAgent + L"\r\n";
-            WinHttpAddRequestHeaders(hReq, uaHdr.c_str(), (DWORD)uaHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        }
-        bool isOverleaf = (url.find(L"overleaf.com") != std::wstring::npos);
-        if (isOverleaf) {
-            std::wstring extraHdr =
-                L"Sec-Fetch-Site: same-origin\r\n"
-                L"Sec-Fetch-Mode: navigate\r\n"
-                L"Sec-Fetch-Dest: document\r\n"
-                L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-                L"Accept-Language: en-US,en;q=0.9\r\n";
-            WinHttpAddRequestHeaders(hReq, extraHdr.c_str(), (DWORD)extraHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        } else {
-            std::wstring acceptHdr = L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n";
-            WinHttpAddRequestHeaders(hReq, acceptHdr.c_str(), (DWORD)acceptHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        }
-
-        {
-            CreateDirectoryW(L"C:\\temp", NULL);
-            std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
-            if (dbg.is_open()) {
-                dbg << L"=== [PROBE REQUEST] ===" << std::endl;
-                dbg << L"URL: " << url << std::endl;
-                dbg << L"Referer: " << m_referer << std::endl;
-                dbg << L"Cookie: " << m_cookies << std::endl;
-                dbg << L"User-Agent: " << m_customUserAgent << std::endl;
-                dbg << L"=======================" << std::endl << std::endl;
-                dbg.close();
-            }
-            std::wofstream dbg2(L"d:\\Download Manager AB\\dm_debug.txt", std::ios::app);
-            if (dbg2.is_open()) {
-                dbg2 << L"=== [PROBE REQUEST] ===" << std::endl;
-                dbg2 << L"URL: " << url << std::endl;
-                dbg2 << L"Referer: " << m_referer << std::endl;
-                dbg2 << L"Cookie: " << m_cookies << std::endl;
-                dbg2 << L"User-Agent: " << m_customUserAgent << std::endl;
-                dbg2 << L"=======================" << std::endl << std::endl;
-                dbg2.close();
-            }
-        }
-
-        if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-            WinHttpReceiveResponse(hReq, NULL)) {
-
-            // Resolve final redirected URL
-            DWORD finalUrlSize = 0;
-            WinHttpQueryOption(hReq, WINHTTP_OPTION_URL, NULL, &finalUrlSize);
-            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && finalUrlSize > 0) {
-                std::vector<wchar_t> finalUrl(finalUrlSize / sizeof(wchar_t) + 1);
-                if (WinHttpQueryOption(hReq, WINHTTP_OPTION_URL, finalUrl.data(), &finalUrlSize)) {
-                    std::wstring resolved = finalUrl.data();
-                    if (!resolved.empty()) {
-                        m_url = resolved;
-                        m_pUrl = CrackHttpUrl(resolved);
-                    }
-                }
-            }
-
-            DWORD sc = 0, scSz = sizeof(sc);
-            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scSz, WINHTTP_NO_HEADER_INDEX);
-            m_diagnosticText = L"HTTP Status: " + std::to_wstring(sc);
-
-            {
-                std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
-                if (dbg.is_open()) {
-                    dbg << L"=== [PROBE RESPONSE] ===" << std::endl;
-                    dbg << L"Status Code: " << sc << std::endl;
-                    dbg << L"========================" << std::endl << std::endl;
-                    dbg.close();
-                }
-            }
-
-            outSupportsRange = false;
-            if (sc == 206) {
-                outSupportsRange = true;
-                wchar_t cr[256] = { 0 };
-                DWORD crSz = sizeof(cr);
-                if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX, cr, &crSz, WINHTTP_NO_HEADER_INDEX)) {
-                    std::wstring crStr = cr;
-                    size_t slash = crStr.find(L'/');
-                    if (slash != std::wstring::npos && slash + 1 < crStr.length()) {
-                        try { outSize = std::stoull(crStr.substr(slash + 1)); } catch (...) {}
-                    }
-                }
-            } else if (sc == 200) {
-                DWORD cl = 0, clSz = sizeof(cl);
-                if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &cl, &clSz, WINHTTP_NO_HEADER_INDEX)) {
-                    outSize = cl;
-                }
-                wchar_t ar[64] = { 0 };
-                DWORD arSz = sizeof(ar);
-                if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, L"Accept-Ranges", ar, &arSz, WINHTTP_NO_HEADER_INDEX)) {
-                    if (std::wstring(ar).find(L"bytes") != std::wstring::npos && outSize > 0) {
-                        outSupportsRange = true;
-                    }
-                }
-            }
-
-            // Drain small body
-            DWORD avail = 0;
-            WinHttpQueryDataAvailable(hReq, &avail);
-            if (avail > 0) {
-                std::vector<BYTE> trash(avail);
-                DWORD got = 0;
-                WinHttpReadData(hReq, trash.data(), avail, &got);
-            }
-        }
-
-        WinHttpCloseHandle(hReq);
-        WinHttpCloseHandle(hConn);
-        WinHttpCloseHandle(hSession);
-        return true;
+        return false;
     }
 
     std::wstring m_cookies;
@@ -395,7 +389,7 @@ public:
             std::wstring curlExe = toolsDir + L"\\curl.exe";
             if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) curlExe = L"curl.exe";
             m_diagnosticText = L"LibreSSL curl (YouTube CDN)";
-            cmd = L"\"" + curlExe + L"\" -s -L --http2";
+            cmd = L"\"" + curlExe + L"\" -s -f -L --http2";
             if (!referer.empty()) cmd += L" -e \"" + referer + L"\"";
             if (!cookies.empty()) cmd += L" -b \"" + cookies + L"\"";
             cmd += L" -A \"" + (!userAgent.empty() ? userAgent : std::wstring(USER_AGENT)) + L"\"";
@@ -413,23 +407,12 @@ public:
             // All other sites: bundled LibreSSL curl (passes Cloudflare)
             std::wstring curlExe = toolsDir + L"\\curl.exe";
             if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) curlExe = L"curl.exe";
-            cmd = L"\"" + curlExe + L"\" -s -L --http2";
+            cmd = L"\"" + curlExe + L"\" -s -f -L --http2";
             if (!referer.empty()) cmd += L" -e \"" + referer + L"\"";
             if (!cookies.empty()) cmd += L" -b \"" + cookies + L"\"";
             cmd += L" -A \"" + (!userAgent.empty() ? userAgent : std::wstring(USER_AGENT)) + L"\"";
             cmd += L" -o \"" + outputPath + L"\"";
             cmd += L" \"" + url + L"\"";
-        }
-
-        {
-            CreateDirectoryW(L"C:\\temp", NULL);
-            std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
-            if (dbg.is_open()) {
-                dbg << L"=== [CURL/YTDLP LAUNCH] ===" << std::endl;
-                dbg << L"Command: " << cmd << std::endl;
-                dbg << L"==========================" << std::endl << std::endl;
-                dbg.close();
-            }
         }
 
         STARTUPINFOW si = { sizeof(STARTUPINFOW) };
@@ -548,11 +531,11 @@ public:
         std::wstring fn;
         probeUrl(url, totalSize, supportsRange, fn);
 
-        // Check if site is Overleaf or Cloudflare protected
+        // Check if site is Overleaf, Claude, or Cloudflare protected
         bool isProtectedSite = (url.find(L"overleaf.com") != std::wstring::npos ||
-                                url.find(L"cloudflare") != std::wstring::npos ||
-                                m_diagnosticText.find(L"403") != std::wstring::npos ||
-                                m_diagnosticText.find(L"401") != std::wstring::npos);
+                                url.find(L"claude.ai") != std::wstring::npos ||
+                                url.find(L"/wiggle/download-file") != std::wstring::npos ||
+                                url.find(L"cloudflare") != std::wstring::npos);
 
         if (isProtectedSite) {
             return downloadViaCurl(url, outputPath, cookies, referer, userAgent);
@@ -571,7 +554,11 @@ public:
         m_lastEtaUpdateTime = std::chrono::steady_clock::now();
         m_samples.clear();
 
-        m_pUrl = CrackHttpUrl(url);
+        // Keep the resolved target URL from probeUrl so Range headers are not stripped by cross-host redirects
+        if (m_url.empty()) {
+            m_url = url;
+        }
+        m_pUrl = CrackHttpUrl(m_url);
 
         m_totalSize = totalSize;
         m_supportsRange = supportsRange;
@@ -933,7 +920,7 @@ private:
                 std::wstring uaHdr = L"User-Agent: " + m_customUserAgent + L"\r\n";
                 WinHttpAddRequestHeaders(hReq, uaHdr.c_str(), (DWORD)uaHdr.length(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
             }
-            bool isOverleaf = (m_url.find(L"overleaf.com") != std::wstring::npos);
+            bool isOverleaf = (m_url.find(L"overleaf.com") != std::wstring::npos || m_url.find(L"claude.ai") != std::wstring::npos);
             if (isOverleaf) {
                 std::wstring extraHdr =
                     L"Sec-Fetch-Site: same-origin\r\n"

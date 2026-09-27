@@ -370,7 +370,7 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
 
         if (id == IDC_PROG_BTN_CANCEL) {
             if (pState->pEngine) {
-                pState->pEngine->PauseDownload(pState->itemId);
+                pState->pEngine->CancelDownload(pState->itemId, true);
             }
             DestroyWindow(hWnd);
             return 0;
@@ -398,7 +398,7 @@ static LRESULT CALLBACK DownloadProgressWndProc(HWND hWnd, UINT message, WPARAM 
 
             // Window Title update (e.g. "24% Internet Download Manager video.mp4")
             wchar_t titleBuf[256];
-            swprintf_s(titleBuf, 256, L"%.0f%% AB Download Manager - %s", pct, pState->currentItem.filename.c_str());
+            swprintf_s(titleBuf, 256, L"%.0f%% PDM Download Manager - %s", pct, pState->currentItem.filename.c_str());
             SetWindowTextW(hWnd, titleBuf);
 
             // 1. Status Text
@@ -564,9 +564,9 @@ void ShowDownloadProgressDialog(HWND hParent, const DownloadItem& item, Download
     int y = (screenH - dlgH) / 2;
 
     HWND hDlg = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        WS_EX_APPWINDOW | WS_EX_TOPMOST,
         L"IDM_DownloadProgressDialogClass",
-        L"0% AB Download Manager",
+        L"0% PDM Download Manager",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
         x, y, dlgW, dlgH,
         hParent, NULL, GetModuleHandle(NULL), pState

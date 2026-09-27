@@ -19,6 +19,7 @@ add_executable(DownloadManagerAB WIN32
     src/SchedulerDialog.cpp
     src/DownloadFileInfoDialog.cpp
     src/DownloadCompleteDialog.cpp
+    resource.rc
 )
 
 target_link_libraries(DownloadManagerAB PRIVATE
@@ -39,4 +40,5 @@ target_link_libraries(DownloadManagerAB PRIVATE
 
 add_executable(IDMNativeHost
     src/IDMNativeHost.cpp
+    resource.rc
 )

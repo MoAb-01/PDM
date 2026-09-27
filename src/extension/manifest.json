@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "AB Download Manager Companion",
+  "name": "PDM Download Manager Companion",
   "version": "1.0.0",
-  "description": "Companion media sniffer & download interception extension for AB Download Manager. Sniffs HLS .m3u8, MPEG-DASH .mpd, video/audio chunks, and direct file streams.",
+  "description": "Companion media sniffer & download interception extension for PDM Download Manager. Sniffs HLS .m3u8, MPEG-DASH .mpd, video/audio chunks, and direct file streams.",
   "icons": {
     "16": "icon16.png",
     "48": "icon48.png",
@@ -27,6 +27,13 @@
   },
   "content_scripts": [
     {
+      "matches": ["*://*.youtube.com/*", "*://youtu.be/*"],
+      "js": ["page_script.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_start",
@@ -35,13 +42,13 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["icon16.png", "icon48.png", "icon128.png"],
+      "resources": ["icon16.png", "icon48.png", "icon128.png", "page_script.js"],
       "matches": ["<all_urls>"]
     }
   ],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "AB Download Manager",
+    "default_title": "PDM Download Manager",
     "default_icon": {
       "16": "icon16.png",
       "48": "icon48.png",

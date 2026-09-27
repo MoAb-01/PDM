@@ -195,7 +195,7 @@ void ShowMediaSnifferDialog(HWND hParent, DownloadItem& outStreamItem, bool& out
     HWND hDlg = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"IDM_SnifferDialogClass",
-        L"AB Media Sniffing & Stream Capture Studio",
+        L"PDM Media Sniffing & Stream Capture Studio",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 580, 420,
         hParent, NULL, GetModuleHandle(NULL), &state

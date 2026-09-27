@@ -21,7 +21,8 @@ public:
       std::function<void(const std::wstring &url, const std::wstring &filename,
                          const std::wstring &referer, const std::wstring &cookies,
                          const std::wstring &userAgent, const std::wstring &quality,
-                         const std::wstring &originalPageUrl)>;
+                         const std::wstring &originalPageUrl, uint64_t totalSize,
+                         uint64_t videoSize, uint64_t audioSize)>;
   using ProbeCallback =
       std::function<std::string(const std::wstring &url)>;
 
@@ -391,6 +392,31 @@ private:
           std::string quality = ExtractJsonStringField(body, "quality");
           std::string origPageUrl = ExtractJsonStringField(body, "originalPageUrl");
 
+          uint64_t totalSize = 0;
+          size_t tsPos = body.find("\"totalSize\":");
+          if (tsPos == std::string::npos) tsPos = body.find("\"fileSize\":");
+          if (tsPos != std::string::npos) {
+            size_t numStart = tsPos + 11;
+            while (numStart < body.length() && (body[numStart] == ' ' || body[numStart] == ':' || body[numStart] == '"')) numStart++;
+            try { totalSize = std::stoull(body.substr(numStart)); } catch (...) {}
+          }
+
+          uint64_t videoSize = 0;
+          size_t vsPos = body.find("\"videoSize\":");
+          if (vsPos != std::string::npos) {
+            size_t numStart = vsPos + 12;
+            while (numStart < body.length() && (body[numStart] == ' ' || body[numStart] == ':' || body[numStart] == '"')) numStart++;
+            try { videoSize = std::stoull(body.substr(numStart)); } catch (...) {}
+          }
+
+          uint64_t audioSize = 0;
+          size_t asPos = body.find("\"audioSize\":");
+          if (asPos != std::string::npos) {
+            size_t numStart = asPos + 12;
+            while (numStart < body.length() && (body[numStart] == ' ' || body[numStart] == ':' || body[numStart] == '"')) numStart++;
+            try { audioSize = std::stoull(body.substr(numStart)); } catch (...) {}
+          }
+
           {
             CreateDirectoryW(L"C:\\temp", NULL);
             std::wofstream dbg(L"C:\\temp\\dm_debug.txt", std::ios::app);
@@ -399,6 +425,9 @@ private:
               dbg << L"Raw Body: " << Utf8ToWide(body) << std::endl;
               dbg << L"Extracted URL: " << Utf8ToWide(url) << std::endl;
               dbg << L"Extracted Filename: " << Utf8ToWide(filename) << std::endl;
+              dbg << L"Extracted TotalSize: " << totalSize << std::endl;
+              dbg << L"Extracted VideoSize: " << videoSize << std::endl;
+              dbg << L"Extracted AudioSize: " << audioSize << std::endl;
               dbg << L"Extracted Referer: " << Utf8ToWide(referer) << std::endl;
               dbg << L"Extracted Cookies: " << Utf8ToWide(cookies) << std::endl;
               dbg << L"Extracted UserAgent: " << Utf8ToWide(userAgent) << std::endl;
@@ -412,7 +441,7 @@ private:
             m_callback(Utf8ToWide(url), Utf8ToWide(filename),
                        Utf8ToWide(referer), Utf8ToWide(cookies),
                        Utf8ToWide(userAgent), Utf8ToWide(quality),
-                       Utf8ToWide(origPageUrl));
+                       Utf8ToWide(origPageUrl), totalSize, videoSize, audioSize);
           }
 
           std::string responseBody = "{\"status\":\"ok\",\"message\":\"Opened Download File Info in IDM C++\"}";

@@ -188,7 +188,7 @@ bool ShowDownloadCompleteDialog(HWND hParent, const DownloadItem& item) {
     int y = (screenH - dlgH) / 2;
 
     HWND hDlg = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        WS_EX_APPWINDOW | WS_EX_TOPMOST,
         L"IDM_DownloadCompleteDialogClass",
         L"Download complete",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,

@@ -1,6 +1,6 @@
 {
   "name": "com.idm.nativehost",
-  "description": "AB Download Manager Native C++ Messaging Host",
+  "description": "PDM Download Manager Native C++ Messaging Host",
   "path": "d:\\Download Manager AB\\cpp\\build\\Release\\IDMNativeHost.exe",
   "type": "stdio",
   "allowed_origins": [

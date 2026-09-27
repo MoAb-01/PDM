@@ -49,6 +49,23 @@ static std::wstring FormatFileSizeDisplay(uint64_t bytes) {
     return buf;
 }
 
+struct MediaProbeCacheEntry {
+    std::wstring title;
+    uint64_t videoSize = 0;
+    uint64_t audioSize = 0;
+};
+static std::unordered_map<std::wstring, MediaProbeCacheEntry> s_streamingCache;
+static std::mutex s_streamingCacheMutex;
+
+void CacheStreamingMediaSizes(const std::wstring& url, const std::wstring& title, uint64_t videoSize, uint64_t audioSize) {
+    if (url.empty()) return;
+    std::lock_guard<std::mutex> lock(s_streamingCacheMutex);
+    auto& entry = s_streamingCache[url];
+    if (!title.empty()) entry.title = title;
+    if (videoSize > 0) entry.videoSize = videoSize;
+    if (audioSize > 0) entry.audioSize = audioSize;
+}
+
 struct DownloadFileInfoState {
     DownloadItem* pItem = nullptr;
     bool startImmediately = true;
@@ -81,13 +98,34 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
         HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
         // Top App Logo
-        HICON hAppLogo = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 18, 18, LR_LOADFROMFILE);
+        HICON hAppLogo = (HICON)LoadImageW(GetModuleHandle(NULL), MAKEINTRESOURCEW(101), IMAGE_ICON, 18, 18, 0);
+        if (!hAppLogo) {
+            hAppLogo = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 18, 18, LR_LOADFROMFILE);
+        }
         if (!hAppLogo) {
             hAppLogo = (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico", IMAGE_ICON, 18, 18, LR_LOADFROMFILE);
         }
         if (hAppLogo) {
             SendMessageW(hWnd, WM_SETICON, ICON_BIG, (LPARAM)hAppLogo);
             SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)hAppLogo);
+        }
+
+        // Check if item is an audio item
+        bool isInitialAudio = (pState->pItem->quality.find(L"Audio") != std::wstring::npos ||
+                               pState->pItem->quality.find(L"MP3") != std::wstring::npos ||
+                               pState->pItem->quality.find(L"M4A") != std::wstring::npos ||
+                               pState->pItem->category == L"Music" ||
+                               pState->pItem->filename.find(L".mp3") != std::wstring::npos);
+        if (isInitialAudio) {
+            pState->pItem->category = L"Music";
+            std::wstring fn = pState->pItem->filename;
+            size_t dotPos = fn.find_last_of(L'.');
+            if (dotPos != std::wstring::npos) {
+                pState->pItem->filename = fn.substr(0, dotPos) + L".mp3";
+            } else {
+                pState->pItem->filename += L".mp3";
+            }
+            pState->pItem->savePath = pState->baseDownloads + L"Music\\" + pState->pItem->filename;
         }
 
         // URL row
@@ -158,13 +196,13 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
         int sel = 0;
         if (pState->pItem->category == L"Compressed") sel = 1;
         else if (pState->pItem->category == L"Documents") sel = 2;
-        else if (pState->pItem->category == L"Music") sel = 3;
+        else if (pState->pItem->category == L"Music" || isInitialAudio) sel = 3;
         else if (pState->pItem->category == L"Programs") sel = 4;
         else if (pState->pItem->category == L"Video") sel = 5;
         SendMessageW(pState->hCatCombo, CB_SETCURSEL, sel, 0);
 
-        // Set initial category icon (check extension for dedicated badges like PDF, DOCX)
-        std::wstring initialCat = pState->pItem->category.empty() ? L"General" : pState->pItem->category;
+        // Set initial category icon (check extension for dedicated badges like PDF, DOCX, Music)
+        std::wstring initialCat = (isInitialAudio || pState->pItem->category == L"Music") ? L"Music" : (pState->pItem->category.empty() ? L"General" : pState->pItem->category);
         std::wstring fn = pState->pItem->filename;
         size_t dotPos = fn.find_last_of(L'.');
         if (dotPos != std::wstring::npos) {
@@ -172,6 +210,10 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
             for (auto& c : ext) c = towlower(c);
             if (ext == L"pdf") initialCat = L"PDF";
             else if (ext == L"docx" || ext == L"doc") initialCat = L"DOCX";
+            else if (ext == L"mp3" || ext == L"m4a" || ext == L"wav" || ext == L"flac") initialCat = L"Music";
+        }
+        if (isInitialAudio) {
+            initialCat = L"Music";
         }
         pState->hCurrentCatIcon = IconFactory::CreateCategoryIcon(44, initialCat);
         if (pState->hCurrentCatIcon) {
@@ -181,103 +223,190 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
         // If it's a streaming URL, probe and update real title and approximate filesize
         if (DownloadEngine::IsStreamingMediaURL(pState->pItem->url)) {
             std::wstring url = pState->pItem->url;
+            std::wstring quality = pState->pItem->quality;
             HWND hSave = pState->hSaveEdit;
             HWND hSize = pState->hSizeLabel;
-            std::wstring baseDir = catDir;
+            HWND hCatCombo = pState->hCatCombo;
+            HWND hPathBox = pState->hPathBox;
+            std::wstring baseDownloads = pState->baseDownloads;
             DownloadItem* pTargetItem = pState->pItem;
 
-            std::thread([url, hSave, hSize, baseDir, pTargetItem, hWnd]() {
-                wchar_t szPath[MAX_PATH] = { 0 };
-                GetModuleFileNameW(NULL, szPath, MAX_PATH);
-                PathRemoveFileSpecW(szPath);
-                std::wstring ytDlp = std::wstring(szPath) + L"\\..\\..\\tools\\yt-dlp.exe";
-                if (!PathFileExistsW(ytDlp.c_str())) ytDlp = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
-
-                std::wstring cmd = L"\"" + ytDlp + L"\" --no-playlist --no-warnings --print \"%(title)s\" --print \"%(filesize,filesize_approx)s\" \"" + url + L"\"";
-
-                SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
-                HANDLE hReadPipe, hWritePipe;
-                if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
-                SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
-
-                STARTUPINFOW si = { sizeof(STARTUPINFOW) };
-                si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-                si.hStdOutput = hWritePipe;
-                si.hStdError = hWritePipe;
-                si.wShowWindow = SW_HIDE;
-
-                PROCESS_INFORMATION pi = { 0 };
-                std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
-                cmdBuf.push_back(0);
-
-                BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
-                CloseHandle(hWritePipe);
-
-                if (!success) {
-                    CloseHandle(hReadPipe);
-                    return;
-                }
-
-                std::string out;
-                char buffer[1024];
-                DWORD bytesRead = 0;
-                while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-                    buffer[bytesRead] = 0;
-                    out += buffer;
-                }
-                CloseHandle(hReadPipe);
-                WaitForSingleObject(pi.hProcess, 10000);
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-
-                std::istringstream iss(out);
-                std::string titleLine, sizeLine;
-                std::getline(iss, titleLine);
-                std::getline(iss, sizeLine);
-
-                while (!titleLine.empty() && (titleLine.back() == '\r' || titleLine.back() == '\n' || titleLine.back() == ' ')) titleLine.pop_back();
-                while (!titleLine.empty() && (titleLine.front() == ' ')) titleLine.erase(titleLine.begin());
-                while (!sizeLine.empty() && (sizeLine.back() == '\r' || sizeLine.back() == '\n' || sizeLine.back() == ' ')) sizeLine.pop_back();
-
-                if (!titleLine.empty() && titleLine != "NA") {
-                    int len = MultiByteToWideChar(CP_UTF8, 0, titleLine.c_str(), (int)titleLine.length(), NULL, 0);
-                    std::wstring title(len, 0);
-                    MultiByteToWideChar(CP_UTF8, 0, titleLine.c_str(), (int)titleLine.length(), &title[0], len);
-
-                    for (auto& ch : title) {
-                        if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
-                            ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
-                            ch = L' ';
-                        }
+            bool hitCache = false;
+            {
+                std::lock_guard<std::mutex> lock(s_streamingCacheMutex);
+                auto it = s_streamingCache.find(url);
+                if (it != s_streamingCache.end()) {
+                    bool isAudio = (pTargetItem->category == L"Music" || isInitialAudio);
+                    uint64_t sz = isAudio ? it->second.audioSize : it->second.videoSize;
+                    if (sz > 0) {
+                        pTargetItem->sizeBytes = sz;
+                        SetWindowTextW(hSize, FormatFileSizeDisplay(sz).c_str());
+                        hitCache = true;
                     }
-                    while (!title.empty() && (title.back() == L' ' || title.back() == L'\t')) title.pop_back();
-                    while (!title.empty() && (title.front() == L' ' || title.front() == L'\t')) title.erase(title.begin());
-                    if (title.length() > 120) title = title.substr(0, 120);
-
-                    if (!title.empty()) {
-                        std::wstring ext = (pTargetItem->quality.find(L"Audio") != std::wstring::npos || pTargetItem->quality.find(L"MP3") != std::wstring::npos) ? L".mp3" : L".mp4";
-                        std::wstring newFilename = title + ext;
-                        std::wstring newSavePath = baseDir + newFilename;
+                    if (!it->second.title.empty()) {
+                        std::wstring ext = isAudio ? L".mp3" : L".mp4";
+                        std::wstring targetCat = isAudio ? L"Music" : (pTargetItem->category.empty() ? L"Video" : pTargetItem->category);
+                        std::wstring newFilename = it->second.title + ext;
+                        std::wstring newSavePath = baseDownloads + targetCat + L"\\" + newFilename;
                         pTargetItem->filename = newFilename;
                         pTargetItem->savePath = newSavePath;
-                        if (IsWindow(hWnd) && IsWindow(hSave)) {
-                            SetWindowTextW(hSave, newSavePath.c_str());
-                        }
+                        pTargetItem->category = targetCat;
+                        SetWindowTextW(hSave, newSavePath.c_str());
+                        SetWindowTextW(hPathBox, (baseDownloads + targetCat + L"\\").c_str());
                     }
                 }
+            }
 
-                if (!sizeLine.empty() && sizeLine != "NA") {
-                    try {
-                        uint64_t parsedSize = std::stoull(sizeLine);
-                        if (parsedSize > 0) {
-                            pTargetItem->sizeBytes = parsedSize;
-                            if (IsWindow(hWnd) && IsWindow(hSize)) {
-                                SetWindowTextW(hSize, FormatFileSizeDisplay(parsedSize).c_str());
+            if (!hitCache) {
+                std::thread([url, quality, hSave, hSize, hCatCombo, hPathBox, baseDownloads, pTargetItem, hWnd]() {
+                    wchar_t szPath[MAX_PATH] = { 0 };
+                    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+                    PathRemoveFileSpecW(szPath);
+                    std::wstring ytDlp = std::wstring(szPath) + L"\\..\\..\\tools\\yt-dlp.exe";
+                    if (!PathFileExistsW(ytDlp.c_str())) ytDlp = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
+
+                    std::wstring fmt;
+                    bool isAudioTarget = (pTargetItem->category == L"Music" ||
+                                          quality.find(L"Audio") != std::wstring::npos ||
+                                          quality.find(L"MP3") != std::wstring::npos ||
+                                          quality.find(L"M4A") != std::wstring::npos);
+
+                    if (isAudioTarget) {
+                        fmt = L"bestaudio[acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec^=aac]/bestaudio/best";
+                    } else if (quality.find(L"1080") != std::wstring::npos) {
+                        fmt = L"bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/"
+                              L"bestvideo[vcodec^=avc][height<=1080]+bestaudio[acodec^=mp4a]/"
+                              L"bestvideo[height<=1080]+bestaudio/"
+                              L"best[height<=1080]/best";
+                    } else if (quality.find(L"720") != std::wstring::npos) {
+                        fmt = L"bestvideo[vcodec^=avc1][height<=720]+bestaudio[acodec^=mp4a]/"
+                              L"bestvideo[vcodec^=avc][height<=720]+bestaudio[acodec^=mp4a]/"
+                              L"bestvideo[height<=720]+bestaudio/"
+                              L"best[height<=720]/best";
+                    } else if (quality.find(L"480") != std::wstring::npos) {
+                        fmt = L"bestvideo[vcodec^=avc1][height<=480]+bestaudio[acodec^=mp4a]/"
+                              L"bestvideo[vcodec^=avc][height<=480]+bestaudio[acodec^=mp4a]/"
+                              L"bestvideo[height<=480]+bestaudio/"
+                              L"best[height<=480]/best";
+                    } else {
+                        fmt = L"bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+                              L"bestvideo+bestaudio/best";
+                    }
+
+                    std::wstring cmd = L"\"" + ytDlp + L"\" --no-playlist --no-warnings --print \"%(title)s\" --print \"%(filesize,filesize_approx)s\" -f \"" + fmt + L"\" \"" + url + L"\"";
+
+                    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+                    HANDLE hReadPipe, hWritePipe;
+                    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
+                    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+                    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+                    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+                    si.hStdOutput = hWritePipe;
+                    si.hStdError = hWritePipe;
+                    si.wShowWindow = SW_HIDE;
+
+                    PROCESS_INFORMATION pi = { 0 };
+                    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+                    cmdBuf.push_back(0);
+
+                    BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+                    CloseHandle(hWritePipe);
+
+                    if (!success) {
+                        CloseHandle(hReadPipe);
+                        return;
+                    }
+
+                    std::string out;
+                    char buffer[1024];
+                    DWORD bytesRead = 0;
+                    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                        buffer[bytesRead] = 0;
+                        out += buffer;
+                    }
+                    CloseHandle(hReadPipe);
+                    WaitForSingleObject(pi.hProcess, 10000);
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+
+                    std::istringstream iss(out);
+                    std::string titleLine, sizeLine;
+                    std::getline(iss, titleLine);
+                    std::getline(iss, sizeLine);
+
+                    while (!titleLine.empty() && (titleLine.back() == '\r' || titleLine.back() == '\n' || titleLine.back() == ' ')) titleLine.pop_back();
+                    while (!titleLine.empty() && (titleLine.front() == ' ')) titleLine.erase(titleLine.begin());
+                    while (!sizeLine.empty() && (sizeLine.back() == '\r' || sizeLine.back() == '\n' || sizeLine.back() == ' ')) sizeLine.pop_back();
+
+                    std::wstring parsedTitle;
+                    if (!titleLine.empty() && titleLine != "NA") {
+                        int len = MultiByteToWideChar(CP_UTF8, 0, titleLine.c_str(), (int)titleLine.length(), NULL, 0);
+                        std::wstring title(len, 0);
+                        MultiByteToWideChar(CP_UTF8, 0, titleLine.c_str(), (int)titleLine.length(), &title[0], len);
+
+                        for (auto& ch : title) {
+                            if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
+                                ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
+                                ch = L' ';
                             }
                         }
-                    } catch (...) {}
-                }
-            }).detach();
+                        while (!title.empty() && (title.back() == L' ' || title.back() == L'\t')) title.pop_back();
+                        while (!title.empty() && (title.front() == L' ' || title.front() == L'\t')) title.erase(title.begin());
+                        if (title.length() > 120) title = title.substr(0, 120);
+
+                        parsedTitle = title;
+                        if (!title.empty()) {
+                            bool isAudio = (pTargetItem->category == L"Music" ||
+                                            pTargetItem->quality.find(L"Audio") != std::wstring::npos ||
+                                            pTargetItem->quality.find(L"MP3") != std::wstring::npos ||
+                                            pTargetItem->quality.find(L"M4A") != std::wstring::npos ||
+                                            pTargetItem->filename.find(L".mp3") != std::wstring::npos ||
+                                            pTargetItem->savePath.find(L"\\Music\\") != std::wstring::npos);
+                            std::wstring ext = (pTargetItem->quality.find(L"M4A") != std::wstring::npos) ? L".m4a" : (isAudio ? L".mp3" : L".mp4");
+                            std::wstring targetCat = isAudio ? L"Music" : (pTargetItem->category.empty() ? L"Video" : pTargetItem->category);
+                            std::wstring targetDir = baseDownloads + targetCat + L"\\";
+                            std::wstring newFilename = title + ext;
+                            std::wstring newSavePath = targetDir + newFilename;
+                            pTargetItem->filename = newFilename;
+                            pTargetItem->savePath = newSavePath;
+                            pTargetItem->category = targetCat;
+
+                            if (IsWindow(hWnd)) {
+                                if (IsWindow(hSave)) SetWindowTextW(hSave, newSavePath.c_str());
+                                if (IsWindow(hPathBox)) SetWindowTextW(hPathBox, targetDir.c_str());
+                                if (isAudio && IsWindow(hCatCombo)) {
+                                    SendMessageW(hCatCombo, CB_SETCURSEL, 3, 0);
+                                }
+                            }
+                        }
+                    }
+
+                    uint64_t parsedSize = 0;
+                    if (!sizeLine.empty() && sizeLine != "NA") {
+                        try {
+                            parsedSize = std::stoull(sizeLine);
+                            if (parsedSize > 0) {
+                                pTargetItem->sizeBytes = parsedSize;
+                                if (IsWindow(hWnd) && IsWindow(hSize)) {
+                                    SetWindowTextW(hSize, FormatFileSizeDisplay(parsedSize).c_str());
+                                }
+                            }
+                        } catch (...) {}
+                    }
+
+                    // Save to memory cache
+                    {
+                        std::lock_guard<std::mutex> lock(s_streamingCacheMutex);
+                        auto& entry = s_streamingCache[url];
+                        if (!parsedTitle.empty()) entry.title = parsedTitle;
+                        if (parsedSize > 0) {
+                            if (isAudioTarget) entry.audioSize = parsedSize;
+                            else entry.videoSize = parsedSize;
+                        }
+                    }
+                }).detach();
+            }
         }
 
         // If file size is 0 and it's a direct URL, probe Content-Length in background with WinHTTP
@@ -319,17 +448,138 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
             const wchar_t* cats[] = { L"General", L"Compressed", L"Documents", L"Music", L"Programs", L"Video" };
             if (curSel >= 0 && curSel < 6) {
                 pState->pItem->category = cats[curSel];
+                bool isMusic = (pState->pItem->category == L"Music");
+
+                // Update filename extension if switching between Video and Music
+                std::wstring fn = pState->pItem->filename;
+                size_t dotPos = fn.find_last_of(L'.');
+                if (isMusic) {
+                    pState->pItem->quality = L"Audio Track (MP3)";
+                    if (dotPos != std::wstring::npos) {
+                        fn = fn.substr(0, dotPos) + L".mp3";
+                    } else {
+                        fn += L".mp3";
+                    }
+                } else if (pState->pItem->category == L"Video") {
+                    pState->pItem->quality = L"1080p Full HD";
+                    if (dotPos != std::wstring::npos) {
+                        fn = fn.substr(0, dotPos) + L".mp4";
+                    } else {
+                        fn += L".mp4";
+                    }
+                }
+                pState->pItem->filename = fn;
+
                 std::wstring newDir = pState->baseDownloads + pState->pItem->category + L"\\";
                 EnsureDirectoryExists(newDir + pState->pItem->filename);
                 pState->pItem->savePath = newDir + pState->pItem->filename;
                 SetWindowTextW(pState->hSaveEdit, pState->pItem->savePath.c_str());
                 SetWindowTextW(pState->hPathBox, newDir.c_str());
 
-                // Update category icon immediately
+                // Update category icon
                 if (pState->hCurrentCatIcon) DestroyIcon(pState->hCurrentCatIcon);
                 pState->hCurrentCatIcon = IconFactory::CreateCategoryIcon(44, pState->pItem->category);
-                if (pState->hCurrentCatIcon && pState->hCatIconPic) {
+                if (pState->hCurrentCatIcon) {
                     SendMessageW(pState->hCatIconPic, STM_SETICON, (WPARAM)pState->hCurrentCatIcon, 0);
+                }
+
+                // If streaming URL, check fast cache or re-probe size for newly selected category!
+                if (DownloadEngine::IsStreamingMediaURL(pState->pItem->url)) {
+                    std::wstring url = pState->pItem->url;
+                    std::wstring quality = pState->pItem->quality;
+                    HWND hSize = pState->hSizeLabel;
+                    DownloadItem* pTargetItem = pState->pItem;
+                    HWND hDlg = hWnd;
+                    bool isAudio = (pTargetItem->category == L"Music");
+
+                    bool foundCache = false;
+                    {
+                        std::lock_guard<std::mutex> lock(s_streamingCacheMutex);
+                        auto it = s_streamingCache.find(url);
+                        if (it != s_streamingCache.end()) {
+                            uint64_t cachedSize = isAudio ? it->second.audioSize : it->second.videoSize;
+                            if (cachedSize > 0) {
+                                pTargetItem->sizeBytes = cachedSize;
+                                SetWindowTextW(hSize, FormatFileSizeDisplay(cachedSize).c_str());
+                                foundCache = true;
+                            }
+                        }
+                    }
+
+                    if (!foundCache) {
+                        SetWindowTextW(hSize, L"Probing...");
+
+                        std::thread([url, quality, hSize, pTargetItem, hDlg, isAudio]() {
+                            wchar_t szPath[MAX_PATH] = { 0 };
+                            GetModuleFileNameW(NULL, szPath, MAX_PATH);
+                            PathRemoveFileSpecW(szPath);
+                            std::wstring ytDlp = std::wstring(szPath) + L"\\..\\..\\tools\\yt-dlp.exe";
+                            if (!PathFileExistsW(ytDlp.c_str())) ytDlp = L"d:\\Download Manager AB\\tools\\yt-dlp.exe";
+
+                            std::wstring fmt;
+                            if (isAudio || quality.find(L"Audio") != std::wstring::npos || quality.find(L"MP3") != std::wstring::npos) {
+                                fmt = L"bestaudio[acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec^=aac]/bestaudio/best";
+                            } else {
+                                fmt = L"bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo+bestaudio/best";
+                            }
+
+                            std::wstring cmd = L"\"" + ytDlp + L"\" --no-playlist --no-warnings --print \"%(filesize,filesize_approx)s\" -f \"" + fmt + L"\" \"" + url + L"\"";
+
+                            SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+                            HANDLE hReadPipe, hWritePipe;
+                            if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
+                            SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+                            STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+                            si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+                            si.hStdOutput = hWritePipe;
+                            si.hStdError = hWritePipe;
+                            si.wShowWindow = SW_HIDE;
+
+                            PROCESS_INFORMATION pi = { 0 };
+                            std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+                            cmdBuf.push_back(0);
+
+                            BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+                            CloseHandle(hWritePipe);
+                            if (!success) { CloseHandle(hReadPipe); return; }
+
+                            std::string out;
+                            char buffer[1024];
+                            DWORD bytesRead = 0;
+                            while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                                buffer[bytesRead] = 0;
+                                out += buffer;
+                            }
+                            CloseHandle(hReadPipe);
+                            WaitForSingleObject(pi.hProcess, 10000);
+                            CloseHandle(pi.hProcess);
+                            CloseHandle(pi.hThread);
+
+                            while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == ' ')) out.pop_back();
+                            while (!out.empty() && (out.front() == ' ')) out.erase(out.begin());
+
+                            if (!out.empty() && out != "NA") {
+                                try {
+                                    uint64_t parsedSize = std::stoull(out);
+                                    if (parsedSize > 0) {
+                                        pTargetItem->sizeBytes = parsedSize;
+                                        if (IsWindow(hDlg) && IsWindow(hSize)) {
+                                            SetWindowTextW(hSize, FormatFileSizeDisplay(parsedSize).c_str());
+                                        }
+
+                                        // Update cache
+                                        {
+                                            std::lock_guard<std::mutex> lock(s_streamingCacheMutex);
+                                            auto& entry = s_streamingCache[url];
+                                            if (isAudio) entry.audioSize = parsedSize;
+                                            else entry.videoSize = parsedSize;
+                                        }
+                                    }
+                                } catch (...) {}
+                            }
+                        }).detach();
+                    }
                 }
             }
             return 0;
@@ -345,19 +595,46 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
         if (id == 201) { // "..." Browse button
             OPENFILENAMEW ofn = { 0 };
             wchar_t szFile[MAX_PATH] = { 0 };
-            wcsncpy_s(szFile, pState->pItem->savePath.c_str(), MAX_PATH - 1);
-
             wchar_t szDir[MAX_PATH] = { 0 };
-            wcsncpy_s(szDir, pState->pItem->savePath.c_str(), MAX_PATH - 1);
-            PathRemoveFileSpecW(szDir);
+
+            if (pState->hSaveEdit && IsWindow(pState->hSaveEdit)) {
+                GetWindowTextW(pState->hSaveEdit, szFile, MAX_PATH);
+            }
+            if (wcslen(szFile) == 0 && pState->pItem) {
+                wcsncpy_s(szFile, pState->pItem->savePath.c_str(), MAX_PATH - 1);
+            }
+
+            // Extract directory and file name
+            wchar_t* pLastSlash = wcsrchr(szFile, L'\\');
+            if (pLastSlash) {
+                size_t dirLen = pLastSlash - szFile;
+                if (dirLen < MAX_PATH) {
+                    wcsncpy_s(szDir, szFile, dirLen);
+                    szDir[dirLen] = 0;
+                }
+            }
+
+            // Extract file part and sanitize illegal filename characters for Windows
+            std::wstring filePart = pLastSlash ? (pLastSlash + 1) : szFile;
+            for (auto& ch : filePart) {
+                if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
+                    ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
+                    ch = L' ';
+                }
+            }
+            while (!filePart.empty() && (filePart.back() == L' ' || filePart.back() == L'\t')) filePart.pop_back();
+            while (!filePart.empty() && (filePart.front() == L' ' || filePart.front() == L'\t')) filePart.erase(filePart.begin());
+            if (filePart.empty()) filePart = L"download.bin";
+
+            wcsncpy_s(szFile, filePart.c_str(), MAX_PATH - 1);
 
             ofn.lStructSize = sizeof(OPENFILENAMEW);
             ofn.hwndOwner = hWnd;
             ofn.lpstrFile = szFile;
             ofn.nMaxFile = MAX_PATH;
-            ofn.lpstrInitialDir = (wcslen(szDir) > 0) ? szDir : NULL;
+            ofn.lpstrInitialDir = (wcslen(szDir) > 0 && PathFileExistsW(szDir)) ? szDir : NULL;
             ofn.lpstrTitle = L"Select Destination File";
-            ofn.lpstrFilter = L"All Files (*.*)\0*.*\0Video Files (*.mp4;*.mkv;*.webm)\0*.mp4;*.mkv;*.webm\0Audio Files (*.mp3;*.flac;*.wav)\0*.mp3;*.flac;*.wav\0Compressed Archives (*.zip;*.rar;*.7z)\0*.zip;*.rar;*.7z\0";
+            ofn.lpstrFilter = L"All Files (*.*)\0*.*\0Video Files (*.mp4;*.mkv;*.webm)\0*.mp4;*.mkv;*.webm\0Audio Files (*.mp3;*.flac;*.wav)\0*.mp3;*.flac;*.wav\0Documents (*.pdf;*.docx;*.xlsx)\0*.pdf;*.docx;*.xlsx\0Compressed Archives (*.zip;*.rar;*.7z)\0*.zip;*.rar;*.7z\0";
             ofn.nFilterIndex = 1;
             ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER;
 
@@ -378,6 +655,15 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
             GetWindowTextW(pState->hUrlEdit, buf, 2048); pState->pItem->url = buf;
             GetWindowTextW(pState->hSaveEdit, buf, 2048); pState->pItem->savePath = buf;
             GetWindowTextW(pState->hDescEdit, buf, 2048); pState->pItem->description = buf;
+
+            // Extract updated filename from savePath
+            std::wstring sp = pState->pItem->savePath;
+            size_t slashPos = sp.find_last_of(L"\\/");
+            if (slashPos != std::wstring::npos && slashPos + 1 < sp.length()) {
+                pState->pItem->filename = sp.substr(slashPos + 1);
+            }
+            pState->pItem->category = DetectCategoryFromFilename(pState->pItem->filename);
+
             EnsureDirectoryExists(pState->pItem->savePath);
             pState->startImmediately = true;
             pState->confirmed = true;
@@ -391,6 +677,15 @@ static LRESULT CALLBACK DownloadFileInfoWndProc(HWND hWnd, UINT message, WPARAM 
             GetWindowTextW(pState->hUrlEdit, buf, 2048); pState->pItem->url = buf;
             GetWindowTextW(pState->hSaveEdit, buf, 2048); pState->pItem->savePath = buf;
             GetWindowTextW(pState->hDescEdit, buf, 2048); pState->pItem->description = buf;
+
+            // Extract updated filename from savePath
+            std::wstring sp = pState->pItem->savePath;
+            size_t slashPos = sp.find_last_of(L"\\/");
+            if (slashPos != std::wstring::npos && slashPos + 1 < sp.length()) {
+                pState->pItem->filename = sp.substr(slashPos + 1);
+            }
+            pState->pItem->category = DetectCategoryFromFilename(pState->pItem->filename);
+
             EnsureDirectoryExists(pState->pItem->savePath);
             pState->startImmediately = false;
             pState->confirmed = true;
@@ -440,6 +735,25 @@ bool ShowDownloadFileInfoDialog(HWND hParent, DownloadItem& item, bool& outStart
     state.pItem = &item;
     state.baseDownloads = GetDefaultDownloadsFolder();
 
+    bool isAudioItem = (item.quality.find(L"Audio") != std::wstring::npos ||
+                        item.quality.find(L"MP3") != std::wstring::npos ||
+                        item.quality.find(L"M4A") != std::wstring::npos ||
+                        item.category == L"Music" ||
+                        item.filename.find(L".mp3") != std::wstring::npos ||
+                        item.savePath.find(L"\\Music\\") != std::wstring::npos);
+    if (isAudioItem) {
+        item.category = L"Music";
+        item.quality = (item.quality.find(L"M4A") != std::wstring::npos) ? L"Audio Track (M4A)" : L"Audio Track (MP3)";
+        std::wstring targetExt = (item.quality.find(L"M4A") != std::wstring::npos) ? L".m4a" : L".mp3";
+        size_t dotPos = item.filename.find_last_of(L'.');
+        if (dotPos != std::wstring::npos) {
+            item.filename = item.filename.substr(0, dotPos) + targetExt;
+        } else {
+            item.filename += targetExt;
+        }
+        item.savePath = state.baseDownloads + L"Music\\" + item.filename;
+    }
+
     // Ensure category folder exists
     std::wstring catDir = state.baseDownloads + (item.category.empty() ? L"General" : item.category) + L"\\";
     EnsureDirectoryExists(catDir + item.filename);
@@ -456,10 +770,10 @@ bool ShowDownloadFileInfoDialog(HWND hParent, DownloadItem& item, bool& outStart
     int y = (screenH - dlgH) / 2;
 
     HWND hDlg = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        WS_EX_APPWINDOW | WS_EX_TOPMOST,
         L"IDM_DownloadFileInfoDialogClass",
         L"Download File Info",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
         x, y, dlgW, dlgH,
         hParent, NULL, GetModuleHandle(NULL), &state
     );
@@ -472,11 +786,12 @@ bool ShowDownloadFileInfoDialog(HWND hParent, DownloadItem& item, bool& outStart
         return false;
     }
 
-    if (hParent) EnableWindow(hParent, FALSE);
+    if (hParent && IsWindow(hParent)) EnableWindow(hParent, FALSE);
 
     ShowWindow(hDlg, SW_SHOWNORMAL);
     UpdateWindow(hDlg);
     SetForegroundWindow(hDlg);
+    BringWindowToTop(hDlg);
 
     // Modal Message Loop
     MSG msg;

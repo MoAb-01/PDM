@@ -2,6 +2,17 @@
 // Automatically detects active video players and injects an ultra-compact floating "Download" pill
 // that opens a sleek glassmorphism dropdown popover with available qualities and formats.
 
+let latestPagePlayerData = null;
+window.addEventListener("IDM_PAGE_PLAYER_DATA", (e) => {
+  if (e && e.detail) {
+    latestPagePlayerData = e.detail;
+  }
+});
+
+function requestPagePlayerInfo() {
+  window.dispatchEvent(new CustomEvent("IDM_QUERY_PAGE_PLAYER"));
+}
+
 // Inject CSS styles for the floating pill and dropdown popover
 const style = document.createElement("style");
 style.textContent = `
@@ -144,7 +155,7 @@ style.textContent = `
     position: absolute !important;
     top: calc(100% + 7px) !important;
     right: 0 !important;
-    width: 280px !important;
+    width: 240px !important;
     background: rgba(13, 17, 23, 0.95) !important;
     backdrop-filter: blur(20px) saturate(190%) !important;
     -webkit-backdrop-filter: blur(20px) saturate(190%) !important;
@@ -324,9 +335,11 @@ style.textContent = `
   .idm-tag-m4a {
     background: rgba(16, 185, 129, 0.2) !important;
     color: #34d399 !important;
-  }
 `;
-document.documentElement.appendChild(style);
+if (!document.getElementById("idm-injected-styles")) {
+  style.id = "idm-injected-styles";
+  (document.head || document.documentElement || document.body).appendChild(style);
+}
 
 // SVG Icons
 const ICON_DOWNLOAD = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2 2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
@@ -336,26 +349,14 @@ const ICON_VIDEO = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
 const ICON_MUSIC = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 const ICON_CHECK = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
 
-// Qualities and formats catalogue with bitrates and fallback sizes
+// Qualities and formats catalogue
 const STREAM_OPTIONS = [
-  { section: "video", name: "1080p Full HD", sub: "MP4 • H.264 Video", tag: "1080p", tagClass: "idm-tag-1080", isAudio: false, bitrate: 5500000, fallbackBytes: 145000000 },
-  { section: "video", name: "720p HD", sub: "MP4 • H.264 Video", tag: "720p", tagClass: "idm-tag-720", isAudio: false, bitrate: 2800000, fallbackBytes: 68000000 },
-  { section: "video", name: "480p SD", sub: "MP4 • Fast Stream", tag: "480p", tagClass: "idm-tag-480", isAudio: false, bitrate: 1100000, fallbackBytes: 26000000 },
-  { section: "audio", name: "Audio Track (MP3)", sub: "MP3 • 320 kbps High Quality", tag: "MP3", tagClass: "idm-tag-audio", isAudio: true, bitrate: 320000, fallbackBytes: 8500000 },
-  { section: "audio", name: "Audio Track (M4A)", sub: "M4A • AAC Stream", tag: "M4A", tagClass: "idm-tag-m4a", isAudio: true, bitrate: 128000, fallbackBytes: 3800000 }
+  { section: "video", name: "1080p Full HD", sub: "MP4 • H.264 Video", tag: "1080p", tagClass: "idm-tag-1080", isAudio: false },
+  { section: "video", name: "720p HD", sub: "MP4 • H.264 Video", tag: "720p", tagClass: "idm-tag-720", isAudio: false },
+  { section: "video", name: "480p SD", sub: "MP4 • Fast Stream", tag: "480p", tagClass: "idm-tag-480", isAudio: false },
+  { section: "audio", name: "Audio Track (MP3)", sub: "MP3 • 320 kbps High Quality", tag: "MP3", tagClass: "idm-tag-audio", isAudio: true },
+  { section: "audio", name: "Audio Track (M4A)", sub: "M4A • AAC Stream", tag: "M4A", tagClass: "idm-tag-m4a", isAudio: true }
 ];
-
-function formatEstimatedSize(bitrateBps, durationSec, fallbackBytes) {
-  let bytes = fallbackBytes;
-  if (durationSec && durationSec > 0 && isFinite(durationSec)) {
-    bytes = (durationSec * bitrateBps) / 8;
-  }
-  if (!bytes || bytes <= 0) return "~25 MB";
-  if (bytes >= 1024 * 1024 * 1024) {
-    return `~${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  }
-  return `~${Math.round(bytes / (1024 * 1024))} MB`;
-}
 
 function attachWidgetToPlayer(playerContainer, videoEl) {
   if (!playerContainer || !videoEl) return;
@@ -390,7 +391,7 @@ function attachWidgetToPlayer(playerContainer, videoEl) {
   pill.className = "idm-pill-btn";
   pill.innerHTML = `
     <div class="idm-pill-main">
-      ${logoUrl ? `<img src="${logoUrl}" width="14" height="14" style="border-radius: 3px; flex-shrink: 0;" alt="AB">` : `<span class="idm-pill-icon">${ICON_DOWNLOAD}</span>`}
+      ${logoUrl ? `<img src="${logoUrl}" width="14" height="14" style="border-radius: 3px; flex-shrink: 0;" alt="PDM">` : `<span class="idm-pill-icon">${ICON_DOWNLOAD}</span>`}
       <span class="idm-pill-label">Download</span>
       ${ICON_CHEVRON}
     </div>
@@ -405,7 +406,7 @@ function attachWidgetToPlayer(playerContainer, videoEl) {
   let popoverHtml = `
     <div class="idm-popover-header">
       <div class="idm-popover-title-row">
-        ${logoUrl ? `<img src="${logoUrl}" width="14" height="14" style="border-radius: 3px;" alt="AB">` : ""}
+        ${logoUrl ? `<img src="${logoUrl}" width="14" height="14" style="border-radius: 3px;" alt="PDM">` : ""}
         <span class="idm-popover-title">Available Formats</span>
       </div>
       <button class="idm-popover-close" type="button" title="Close Menu">${ICON_CLOSE}</button>
@@ -414,18 +415,12 @@ function attachWidgetToPlayer(playerContainer, videoEl) {
     <div class="idm-stream-list">
   `;
 
-  const videoDuration = (videoEl && videoEl.duration && isFinite(videoEl.duration) && videoEl.duration > 0)
-    ? videoEl.duration
-    : 0;
-
   let lastSection = "video";
   STREAM_OPTIONS.forEach(opt => {
     if (opt.section !== lastSection) {
       popoverHtml += `</div><div class="idm-section-label" style="margin-top: 6px;">Audio Only</div><div class="idm-stream-list">`;
       lastSection = opt.section;
     }
-
-    const sizeText = formatEstimatedSize(opt.bitrate, videoDuration, opt.fallbackBytes);
 
     popoverHtml += `
       <div class="idm-stream-item" data-quality="${opt.name}" data-audio="${opt.isAudio}">
@@ -437,7 +432,6 @@ function attachWidgetToPlayer(playerContainer, videoEl) {
           </div>
         </div>
         <div class="idm-stream-right">
-          <span class="idm-stream-size">${sizeText}</span>
           <span class="idm-quality-tag ${opt.tagClass}">${opt.tag}</span>
         </div>
       </div>
@@ -449,20 +443,23 @@ function attachWidgetToPlayer(playerContainer, videoEl) {
 
   wrapper.appendChild(pill);
   wrapper.appendChild(popover);
-
-  // Prevent video player events (play/pause, seek) when clicking inside widget
-  wrapper.addEventListener("click", (e) => e.stopPropagation());
-  wrapper.addEventListener("mousedown", (e) => e.stopPropagation());
-  wrapper.addEventListener("dblclick", (e) => e.stopPropagation());
+  playerContainer.appendChild(wrapper);
 
   const pillMain = pill.querySelector(".idm-pill-main");
   const pillCloseBtn = pill.querySelector(".idm-pill-close");
   const popoverCloseBtn = popover.querySelector(".idm-popover-close");
 
+  // Prevent video player events (play/pause, seek) when interacting with widget
+  wrapper.addEventListener("click", (e) => e.stopPropagation());
+  wrapper.addEventListener("mousedown", (e) => e.stopPropagation());
+  wrapper.addEventListener("dblclick", (e) => e.stopPropagation());
+  wrapper.addEventListener("mouseenter", () => requestPagePlayerInfo());
+
   // Toggle Dropdown when clicking main pill
   pillMain.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
+    requestPagePlayerInfo();
 
     const isOpen = popover.classList.contains("idm-open");
     if (isOpen) {
@@ -616,6 +613,83 @@ function extractVideoTitle() {
   return cleanName || "video_stream";
 }
 
+// Helper to extract ytInitialPlayerResponse from page scripts or player
+function extractYouTubeStreamingInfo() {
+  try {
+    const scripts = document.getElementsByTagName("script");
+    for (let i = 0; i < scripts.length; i++) {
+      const text = scripts[i].textContent;
+      if (text && text.includes("ytInitialPlayerResponse =")) {
+        const start = text.indexOf("ytInitialPlayerResponse =");
+        if (start !== -1) {
+          const jsonStart = text.indexOf("{", start);
+          const end = text.indexOf("};", jsonStart);
+          if (jsonStart !== -1 && end !== -1) {
+            const raw = text.substring(jsonStart, end + 1);
+            return JSON.parse(raw);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[IDM Content] Error extracting ytInitialPlayerResponse:", e);
+  }
+  return null;
+}
+
+function getYouTubeStreamSizes(playerResponse, selectedQuality, isAudio) {
+  let videoBytes = 0;
+  let audioBytes = 0;
+  let title = "";
+
+  if (playerResponse && playerResponse.videoDetails) {
+    title = playerResponse.videoDetails.title || "";
+  }
+
+  if (playerResponse && playerResponse.streamingData && playerResponse.streamingData.adaptiveFormats) {
+    const formats = playerResponse.streamingData.adaptiveFormats;
+
+    // Find best audio size
+    const audioFormats = formats.filter(f => f.mimeType && f.mimeType.startsWith("audio/"));
+    for (const af of audioFormats) {
+      const len = parseInt(af.contentLength, 10);
+      if (len > audioBytes) audioBytes = len;
+    }
+
+    // Find requested video quality size
+    const targetHeight = selectedQuality.includes("1080") ? 1080 :
+                         selectedQuality.includes("720") ? 720 :
+                         selectedQuality.includes("480") ? 480 : 1080;
+
+    const videoFormats = formats.filter(f => f.mimeType && f.mimeType.startsWith("video/"));
+    for (const vf of videoFormats) {
+      if (vf.height === targetHeight || (vf.qualityLabel && vf.qualityLabel.includes(targetHeight + "p"))) {
+        const len = parseInt(vf.contentLength, 10);
+        if (len > 0) {
+          videoBytes = len;
+          break;
+        }
+      }
+    }
+    // Fallback if target height not found
+    if (videoBytes === 0 && videoFormats.length > 0) {
+      for (const vf of videoFormats) {
+        const len = parseInt(vf.contentLength, 10);
+        if (len > videoBytes) videoBytes = len;
+      }
+    }
+  }
+
+  let totalSize = 0;
+  if (isAudio) {
+    totalSize = audioBytes;
+  } else {
+    totalSize = (videoBytes > 0 && audioBytes > 0) ? (videoBytes + audioBytes) : (videoBytes || audioBytes);
+  }
+
+  return { title, videoBytes, audioBytes, totalSize };
+}
+
 // Download execution handler
 function triggerDownload(selectedQuality, isAudio, videoEl) {
   const pageUrl = window.location.href;
@@ -629,7 +703,26 @@ function triggerDownload(selectedQuality, isAudio, videoEl) {
     }
   }
 
-  const pageTitle = extractVideoTitle();
+  let pageTitle = extractVideoTitle();
+  let precomputedSize = 0;
+  let precomputedVideoSize = 0;
+  let precomputedAudioSize = 0;
+
+  if (isYouTube) {
+    let ytInfo = latestPagePlayerData;
+    if (!ytInfo || !ytInfo.streamingData) {
+      ytInfo = extractYouTubeStreamingInfo();
+    }
+    if (ytInfo) {
+      const ytSizes = getYouTubeStreamSizes(ytInfo, selectedQuality, isAudio);
+      if (ytSizes.title) pageTitle = ytSizes.title;
+      precomputedSize = ytSizes.totalSize;
+      precomputedVideoSize = ytSizes.videoBytes;
+      precomputedAudioSize = ytSizes.audioBytes;
+      console.log("[IDM Content] In-page YouTube Pre-Sniffing (0 ms):", ytSizes);
+    }
+  }
+
   const ext = isAudio ? ".mp3" : ".mp4";
   const filename = pageTitle + ext;
 
@@ -639,7 +732,10 @@ function triggerDownload(selectedQuality, isAudio, videoEl) {
     filename: filename,
     mimeType: isAudio ? "audio/mp3" : "video/mp4",
     quality: selectedQuality,
-    referer: window.location.origin
+    referer: window.location.origin,
+    totalSize: precomputedSize,
+    videoSize: precomputedVideoSize,
+    audioSize: precomputedAudioSize
   };
 
   console.log("[IDM Extension] Triggering Download for:", payload);

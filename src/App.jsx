@@ -173,7 +173,7 @@ export default function App() {
           <div className="idm-globe-icon" />
           <span>Internet Download Manager 6.42</span>
           <span style={{ color: "#06b6d4", fontSize: "10.5px", fontWeight: "bold", marginLeft: 4 }}>
-            [AB Edition • High-Speed Sniffer Engine]
+            [PDM Edition • High-Speed Sniffer Engine]
           </span>
         </div>
 
@@ -282,7 +282,7 @@ export default function App() {
           className="idm-menu-item"
           onClick={() =>
             alert(
-              "Internet Download Manager 6.42 Pro (AB Edition)\nEquipped with Multi-Thread Range Chunking, HLS/DASH Media Sniffer, and Native Browser Integration."
+              "Internet Download Manager 6.42 Pro (PDM Edition)\nEquipped with Multi-Thread Range Chunking, HLS/DASH Media Sniffer, and Native Browser Integration."
             )
           }
         >

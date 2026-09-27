@@ -1,6 +1,6 @@
 @echo off
 echo ===================================================
-echo Compiling IDM Download Manager AB in Native C++20
+echo Compiling PDM Download Manager in Native C++20
 echo ===================================================
 
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"

@@ -92,6 +92,7 @@ struct DownloadItem {
     std::wstring cookies;
     std::wstring userAgent;
     std::wstring lastTryDate;
+    std::wstring queueName;
 
     uint64_t sizeBytes = 0;
     uint64_t downloadedBytes = 0;
@@ -121,3 +122,33 @@ struct IDMSettings {
     int speedLimitKBps = 2048;
     std::wstring userAgent = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 };
+
+inline std::wstring DetectCategoryFromFilename(const std::wstring& filename) {
+    if (filename == L"zip" || filename == L"rar" || filename == L"7z" || filename == L"tar" || filename == L"gz" || filename == L"bz2" || filename == L"iso") {
+        return L"Compressed";
+    }
+    if (filename == L"mp4" || filename == L"mkv" || filename == L"avi" || filename == L"mov" || filename == L"webm" || filename == L"flv") {
+        return L"Video";
+    }
+    if (filename == L"mp3" || filename == L"wav" || filename == L"flac" || filename == L"aac" || filename == L"m4a") {
+        return L"Music";
+    }
+    if (filename == L"pdf" || filename == L"doc" || filename == L"docx" || filename == L"tex" || filename == L"txt") {
+        return L"Documents";
+    }
+    if (filename == L"exe" || filename == L"msi" || filename == L"apk") {
+        return L"Programs";
+    }
+    
+    size_t dot = filename.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot + 1 < filename.length()) {
+        std::wstring ext = filename.substr(dot + 1);
+        for (auto& ch : ext) ch = towlower(ch);
+        if (ext == L"zip" || ext == L"rar" || ext == L"7z" || ext == L"tar" || ext == L"gz" || ext == L"bz2" || ext == L"iso") return L"Compressed";
+        if (ext == L"mp4" || ext == L"mkv" || ext == L"avi" || ext == L"mov" || ext == L"webm" || ext == L"flv") return L"Video";
+        if (ext == L"mp3" || ext == L"wav" || ext == L"flac" || ext == L"aac" || ext == L"m4a") return L"Music";
+        if (ext == L"pdf" || ext == L"doc" || ext == L"docx" || ext == L"tex" || ext == L"txt" || ext == L"pptx" || ext == L"xlsx") return L"Documents";
+        if (ext == L"exe" || ext == L"msi" || ext == L"apk") return L"Programs";
+    }
+    return L"General";
+}

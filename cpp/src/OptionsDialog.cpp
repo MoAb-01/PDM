@@ -40,7 +40,7 @@ static LRESULT CALLBACK OptionsWndProc(HWND hWnd, UINT message, WPARAM wParam, L
 
         // General Tab Controls
         HWND hGrpBrowser = CreateWindowW(L"STATIC", L"Capture downloads from the following browsers:", WS_CHILD | WS_VISIBLE | SS_LEFT, 24, 50, 400, 18, hWnd, NULL, NULL, NULL);
-        pState->hChkStartup = CreateWindowW(L"BUTTON", L"Launch AB Download Manager on startup", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 24, 75, 380, 20, hWnd, (HMENU)2001, NULL, NULL);
+        pState->hChkStartup = CreateWindowW(L"BUTTON", L"Launch PDM Download Manager on startup", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 24, 75, 380, 20, hWnd, (HMENU)2001, NULL, NULL);
         pState->hChkClip = CreateWindowW(L"BUTTON", L"Automatically start downloading of URLs placed to clipboard", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 24, 100, 380, 20, hWnd, (HMENU)2002, NULL, NULL);
 
         HWND hChkChrome = CreateWindowW(L"BUTTON", L"Google Chrome", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 40, 130, 200, 20, hWnd, NULL, NULL, NULL);
@@ -132,7 +132,7 @@ void ShowOptionsDialog(HWND hParent, IDMSettings* pSettings) {
     HWND hDlg = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"IDM_OptionsDialogClass",
-        L"AB Download Manager Configuration",
+        L"PDM Download Manager Configuration",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 470, 480,
         hParent, NULL, GetModuleHandle(NULL), &state

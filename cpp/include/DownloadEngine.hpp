@@ -33,6 +33,14 @@ public:
   void StopAll();
   void ResumeAll();
 
+  bool StartQueue();
+  void StopQueue();
+  bool IsQueueActive() const;
+  void ProcessNextQueueItem();
+  std::wstring GetActiveQueueItemId();
+  static bool CheckDiskSpace(const std::wstring &path, uint64_t requiredBytes,
+                             uint64_t &outFreeBytes);
+
   std::vector<DownloadItem> GetDownloads();
   DownloadItem GetItem(const std::wstring &id);
   std::shared_ptr<std::array<LiveStreamSlot, 16>>
@@ -58,6 +66,8 @@ public:
   static bool MuxVideoAudio(const std::wstring &videoPath,
                             const std::wstring &audioPath,
                             const std::wstring &outputPath);
+  static bool ConvertToMp3(const std::wstring &inputAudioPath,
+                           const std::wstring &outputMp3Path);
   static std::string ProbeFormatSizesJson(const std::wstring &pageUrl);
   static std::wstring GetMediaTitle(const std::wstring &pageUrl);
 
@@ -71,12 +81,14 @@ private:
   std::atomic<bool> m_running{true};
   std::atomic<bool> m_speedLimitEnabled{false};
   std::atomic<int> m_speedLimitKBps{2048};
+  std::atomic<bool> m_queueActive{false};
+  std::wstring m_activeQueueItemId;
 
   ProgressCallback m_onProgress;
   StatusCallback m_onStatus;
 
   std::vector<std::thread> m_activeThreads;
   std::mutex m_downloaderMutex;
-  std::map<std::wstring, std::shared_ptr<class SegmentedDownloader>>
+  std::map<std::wstring, std::vector<std::shared_ptr<class SegmentedDownloader>>>
       m_activeDownloaders;
 };

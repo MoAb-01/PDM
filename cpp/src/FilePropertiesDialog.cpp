@@ -142,6 +142,13 @@ static LRESULT CALLBACK FilePropertiesWndProc(HWND hWnd, UINT message, WPARAM wP
         if (id == IDOK) {
             wchar_t buf[1024];
             GetWindowTextW(pState->hSaveTo, buf, 1024); pState->pItem->savePath = buf;
+            std::wstring sp = pState->pItem->savePath;
+            size_t slashPos = sp.find_last_of(L"\\/");
+            if (slashPos != std::wstring::npos && slashPos + 1 < sp.length()) {
+                pState->pItem->filename = sp.substr(slashPos + 1);
+            }
+            pState->pItem->category = DetectCategoryFromFilename(pState->pItem->filename);
+
             GetWindowTextW(pState->hAddr, buf, 1024); pState->pItem->url = buf;
             GetWindowTextW(pState->hDesc, buf, 1024); pState->pItem->description = buf;
             GetWindowTextW(pState->hRef, buf, 1024); pState->pItem->referer = buf;

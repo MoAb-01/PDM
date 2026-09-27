@@ -4,9 +4,21 @@
 #include <iostream>
 #include <fstream>
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <sstream>
 #include <regex>
 #include <iomanip>
+
+inline std::wstring GetDefaultDownloadsFolder() {
+    wchar_t* pPath = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, NULL, &pPath))) {
+        std::wstring res = pPath;
+        CoTaskMemFree(pPath);
+        if (!res.empty() && res.back() != L'\\') res += L'\\';
+        return res;
+    }
+    return L"C:\\Downloads\\";
+}
 
 // Checks if URL is a web streaming video platform (YouTube, Shorts, TikTok, Vimeo, etc.)
 static bool IsStreamingPlatformUrl(const std::wstring& url) {
@@ -163,8 +175,8 @@ DownloadItem DownloadEngine::GetItem(const std::wstring& id) {
     {
         std::lock_guard<std::mutex> lock(m_downloaderMutex);
         auto it = m_activeDownloaders.find(id);
-        if (it != m_activeDownloaders.end()) {
-            pDownloader = it->second;
+        if (it != m_activeDownloaders.end() && !it->second.empty()) {
+            pDownloader = it->second.front();
         }
     }
 
@@ -198,8 +210,8 @@ std::shared_ptr<std::array<LiveStreamSlot, 16>> DownloadEngine::GetLiveSlots(con
     {
         std::lock_guard<std::mutex> lock(m_downloaderMutex);
         auto it = m_activeDownloaders.find(id);
-        if (it != m_activeDownloaders.end() && it->second) {
-            return it->second->getLiveSlots();
+        if (it != m_activeDownloaders.end() && !it->second.empty() && it->second.front()) {
+            return it->second.front()->getLiveSlots();
         }
     }
     std::lock_guard<std::mutex> lockItem(m_mutex);
@@ -225,15 +237,28 @@ void DownloadEngine::UpdateItem(const DownloadItem& item) {
 void DownloadEngine::CleanupDownloadDiskFiles(const DownloadItem& item, bool deleteIncompleteTarget) {
     if (!item.videoTmpPath.empty()) {
         DeleteFileW(item.videoTmpPath.c_str());
+        std::wstring vMeta = item.videoTmpPath + L".partial";
+        DeleteFileW(vMeta.c_str());
     }
     if (!item.audioTmpPath.empty()) {
         DeleteFileW(item.audioTmpPath.c_str());
+        std::wstring aMeta = item.audioTmpPath + L".partial";
+        DeleteFileW(aMeta.c_str());
     }
     if (!item.savePath.empty()) {
         std::wstring videoTmp = item.savePath + L".video_" + item.id + L".tmp";
         std::wstring audioTmp = item.savePath + L".audio_" + item.id + L".tmp";
+        std::wstring rawAudioTmp = item.savePath + L".raw_audio_" + item.id + L".tmp";
         DeleteFileW(videoTmp.c_str());
         DeleteFileW(audioTmp.c_str());
+        DeleteFileW(rawAudioTmp.c_str());
+
+        std::wstring vMeta = videoTmp + L".partial";
+        std::wstring aMeta = audioTmp + L".partial";
+        std::wstring rMeta = rawAudioTmp + L".partial";
+        DeleteFileW(vMeta.c_str());
+        DeleteFileW(aMeta.c_str());
+        DeleteFileW(rMeta.c_str());
 
         std::wstring metaPath = item.savePath + L".partial";
         DeleteFileW(metaPath.c_str());
@@ -252,8 +277,10 @@ void DownloadEngine::CancelDownload(const std::wstring& id, bool deleteFiles) {
     {
         std::lock_guard<std::mutex> lockDownloader(m_downloaderMutex);
         auto it = m_activeDownloaders.find(id);
-        if (it != m_activeDownloaders.end() && it->second) {
-            it->second->cancel(deleteFiles);
+        if (it != m_activeDownloaders.end()) {
+            for (auto& dl : it->second) {
+                if (dl) dl->cancel(deleteFiles);
+            }
             m_activeDownloaders.erase(it);
         }
     }
@@ -284,8 +311,10 @@ void DownloadEngine::DeleteItem(const std::wstring& id) {
     {
         std::lock_guard<std::mutex> lockDownloader(m_downloaderMutex);
         auto it = m_activeDownloaders.find(id);
-        if (it != m_activeDownloaders.end() && it->second) {
-            it->second->cancel(true);
+        if (it != m_activeDownloaders.end()) {
+            for (auto& dl : it->second) {
+                if (dl) dl->cancel(true);
+            }
             m_activeDownloaders.erase(it);
         }
     }
@@ -324,15 +353,19 @@ void DownloadEngine::StartDownload(const std::wstring& id) {
 
     if (m_onStatus) m_onStatus(id, DownloadStatus::Downloading);
 
-    m_activeThreads.emplace_back(&DownloadEngine::DownloadWorker, this, id);
+    std::thread([this, id]() {
+        DownloadWorker(id);
+    }).detach();
 }
 
 void DownloadEngine::PauseDownload(const std::wstring& id) {
     {
         std::lock_guard<std::mutex> lock(m_downloaderMutex);
         auto it = m_activeDownloaders.find(id);
-        if (it != m_activeDownloaders.end() && it->second) {
-            it->second->pause();
+        if (it != m_activeDownloaders.end()) {
+            for (auto& dl : it->second) {
+                if (dl) dl->pause();
+            }
         }
     }
     {
@@ -354,7 +387,9 @@ void DownloadEngine::StopAll() {
     {
         std::lock_guard<std::mutex> lock(m_downloaderMutex);
         for (auto& pair : m_activeDownloaders) {
-            if (pair.second) pair.second->pause();
+            for (auto& dl : pair.second) {
+                if (dl) dl->pause();
+            }
         }
     }
     std::vector<std::wstring> pausedIds;
@@ -392,11 +427,129 @@ void DownloadEngine::ResumeAll() {
     }
 }
 
+bool DownloadEngine::CheckDiskSpace(const std::wstring& path, uint64_t requiredBytes, uint64_t& outFreeBytes) {
+    outFreeBytes = 0;
+    wchar_t volumePath[MAX_PATH] = { 0 };
+    if (!GetVolumePathNameW(path.c_str(), volumePath, MAX_PATH)) {
+        if (path.length() >= 3 && path[1] == L':') {
+            wcsncpy_s(volumePath, path.substr(0, 3).c_str(), MAX_PATH - 1);
+        } else {
+            return true; // Unable to determine root, allow download
+        }
+    }
+    ULARGE_INTEGER freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes;
+    if (GetDiskFreeSpaceExW(volumePath, &freeBytesAvailable, &totalNumberOfBytes, &totalNumberOfFreeBytes)) {
+        outFreeBytes = freeBytesAvailable.QuadPart;
+        // Require file size + 100 MB safety buffer
+        uint64_t safetyMargin = 100ULL * 1024ULL * 1024ULL;
+        if (requiredBytes > 0 && outFreeBytes < (requiredBytes + safetyMargin)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DownloadEngine::StartQueue() {
+    bool hasQueued = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& d : m_downloads) {
+            if (d.status == DownloadStatus::Queued) {
+                hasQueued = true;
+                break;
+            }
+        }
+    }
+
+    if (!hasQueued) {
+        return false;
+    }
+
+    m_queueActive = true;
+    ProcessNextQueueItem();
+    return true;
+}
+
+void DownloadEngine::StopQueue() {
+    m_queueActive = false;
+    std::wstring currentId;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        currentId = m_activeQueueItemId;
+        m_activeQueueItemId.clear();
+    }
+    if (!currentId.empty()) {
+        PauseDownload(currentId);
+    }
+}
+
+bool DownloadEngine::IsQueueActive() const {
+    return m_queueActive.load();
+}
+
+std::wstring DownloadEngine::GetActiveQueueItemId() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_activeQueueItemId;
+}
+
+void DownloadEngine::ProcessNextQueueItem() {
+    if (!m_queueActive.load()) return;
+
+    DownloadItem targetItem;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& d : m_downloads) {
+            if (d.status == DownloadStatus::Queued) {
+                targetItem = d;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        m_queueActive = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_activeQueueItemId.clear();
+        }
+        return;
+    }
+
+    // Check destination drive space
+    uint64_t freeBytes = 0;
+    if (!CheckDiskSpace(targetItem.savePath, targetItem.sizeBytes, freeBytes)) {
+        m_queueActive = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (auto& d : m_downloads) {
+                if (d.id == targetItem.id) {
+                    d.status = DownloadStatus::Error;
+                    d.diagnosticText = L"Paused: Insufficient disk space on destination drive.";
+                    break;
+                }
+            }
+            m_activeQueueItemId.clear();
+        }
+        if (m_onStatus) m_onStatus(targetItem.id, DownloadStatus::Error);
+        SaveHistory();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_activeQueueItemId = targetItem.id;
+    }
+
+    StartDownload(targetItem.id);
+}
+
 std::shared_ptr<SegmentedDownloader> DownloadEngine::GetActiveDownloader(const std::wstring& id) {
     std::lock_guard<std::mutex> lock(m_downloaderMutex);
     auto it = m_activeDownloaders.find(id);
-    if (it != m_activeDownloaders.end()) {
-        return it->second;
+    if (it != m_activeDownloaders.end() && !it->second.empty()) {
+        return it->second.front();
     }
     return nullptr;
 }
@@ -630,6 +783,31 @@ bool DownloadEngine::MuxVideoAudio(const std::wstring& videoPath, const std::wst
     return (exitCode == 0);
 }
 
+bool DownloadEngine::ConvertToMp3(const std::wstring& inputAudioPath, const std::wstring& outputMp3Path) {
+    std::wstring ffmpeg = FindFFmpegPath();
+
+    std::wstring cmd = L"\"" + ffmpeg + L"\" -y -i \"" + inputAudioPath + L"\" -vn -c:a libmp3lame -b:a 320k \"" + outputMp3Path + L"\"";
+
+    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = { 0 };
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+
+    BOOL success = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+    if (!success) return false;
+
+    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return (exitCode == 0);
+}
+
 void DownloadEngine::DownloadWorker(std::wstring id) {
     DownloadItem item;
     {
@@ -664,8 +842,26 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
             return;
         }
 
-        // Apply extracted video title automatically if available
-        if (!streams.title.empty()) {
+        bool isAudio = (item.quality.find(L"Audio") != std::wstring::npos ||
+                        item.quality.find(L"MP3") != std::wstring::npos ||
+                        item.quality.find(L"M4A") != std::wstring::npos);
+        std::wstring targetExt = (item.quality.find(L"M4A") != std::wstring::npos) ? L".m4a" : (isAudio ? L".mp3" : L".mp4");
+
+        // Apply extracted video title automatically if available and user didn't specify a custom filename
+        bool hasCustomFilename = (!item.filename.empty() &&
+                                  item.filename != L"YouTube_Video.mp4" &&
+                                  item.filename != L"YouTube_Audio.mp3" &&
+                                  item.filename != L"Facebook_Video.mp4" &&
+                                  item.filename != L"Facebook_Audio.mp3" &&
+                                  item.filename != L"Stream_Video.mp4" &&
+                                  item.filename != L"Stream_Audio.mp3" &&
+                                  item.filename != L"video.mp4" &&
+                                  item.filename != L"audio.mp3" &&
+                                  item.filename != L"watch.mp4" &&
+                                  item.filename != L"download.bin" &&
+                                  item.filename != L"videoplayback.mp4");
+
+        if (!hasCustomFilename && !streams.title.empty()) {
             std::wstring cleanTitle = streams.title;
             for (auto& ch : cleanTitle) {
                 if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
@@ -678,8 +874,7 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
             if (cleanTitle.length() > 120) cleanTitle = cleanTitle.substr(0, 120);
 
             if (!cleanTitle.empty()) {
-                std::wstring ext = (item.quality.find(L"Audio") != std::wstring::npos || item.quality.find(L"MP3") != std::wstring::npos) ? L".mp3" : L".mp4";
-                item.filename = cleanTitle + ext;
+                item.filename = cleanTitle + targetExt;
 
                 wchar_t szDir[MAX_PATH] = { 0 };
                 wcsncpy_s(szDir, item.savePath.c_str(), MAX_PATH - 1);
@@ -687,7 +882,7 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                 if (wcslen(szDir) > 0) {
                     item.savePath = std::wstring(szDir) + L"\\" + item.filename;
                 } else {
-                    item.savePath = L"C:\\Users\\UHD\\Downloads\\Video\\" + item.filename;
+                    item.savePath = GetDefaultDownloadsFolder() + (isAudio ? L"Music\\" : L"Video\\") + item.filename;
                 }
 
                 {
@@ -704,8 +899,14 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
         }
 
         // Ensure proper filename and savePath extension (.mp4 or .mp3)
-        std::wstring targetExt = (item.quality.find(L"Audio") != std::wstring::npos || item.quality.find(L"MP3") != std::wstring::npos) ? L".mp3" : L".mp4";
-        if (item.savePath.find(L".mp4") == std::wstring::npos && item.savePath.find(L".mp3") == std::wstring::npos) {
+        if (isAudio && item.savePath.length() > 4 && item.savePath.substr(item.savePath.length() - 4) == L".mp4") {
+            item.savePath = item.savePath.substr(0, item.savePath.length() - 4) + targetExt;
+        }
+        if (isAudio && item.filename.length() > 4 && item.filename.substr(item.filename.length() - 4) == L".mp4") {
+            item.filename = item.filename.substr(0, item.filename.length() - 4) + targetExt;
+        }
+
+        if (item.savePath.find(L".mp4") == std::wstring::npos && item.savePath.find(L".mp3") == std::wstring::npos && item.savePath.find(L".m4a") == std::wstring::npos) {
             item.savePath += targetExt;
             item.filename += targetExt;
             {
@@ -729,7 +930,7 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
 
             {
                 std::lock_guard<std::mutex> lock(m_downloaderMutex);
-                m_activeDownloaders[id] = pVideoDownloader;
+                m_activeDownloaders[id] = { pVideoDownloader, pAudioDownloader };
             }
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -744,14 +945,14 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                 }
             }
 
-            std::atomic<bool> videoComplete{ false };
-            std::atomic<bool> audioComplete{ false };
-            std::atomic<bool> videoFailed{ false };
-            std::atomic<bool> audioFailed{ false };
+            auto pVideoComplete = std::make_shared<std::atomic<bool>>(false);
+            auto pAudioComplete = std::make_shared<std::atomic<bool>>(false);
+            auto pVideoFailed = std::make_shared<std::atomic<bool>>(false);
+            auto pAudioFailed = std::make_shared<std::atomic<bool>>(false);
 
-            pVideoDownloader->start(streams.videoUrl, videoTmp, 12, [this, id, pAudioDownloader, &videoComplete, &videoFailed](const DownloadStats& vStats) {
-                if (vStats.isComplete) videoComplete.store(true, std::memory_order_relaxed);
-                if (vStats.isFailed) videoFailed.store(true, std::memory_order_relaxed);
+            pVideoDownloader->start(streams.videoUrl, videoTmp, 12, [this, id, pAudioDownloader, pVideoComplete, pVideoFailed](const DownloadStats& vStats) {
+                if (vStats.isComplete) pVideoComplete->store(true, std::memory_order_relaxed);
+                if (vStats.isFailed) pVideoFailed->store(true, std::memory_order_relaxed);
 
                 uint64_t aDown = pAudioDownloader->getDownloadedBytes();
                 uint64_t aTot = pAudioDownloader->getTotalSize();
@@ -773,16 +974,16 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                 if (m_onProgress) m_onProgress(id, totalDown, totalSize, (uint64_t)vStats.smoothedSpeedBps);
             });
 
-            pAudioDownloader->start(streams.audioUrl, audioTmp, 4, [&audioComplete, &audioFailed](const DownloadStats& aStats) {
-                if (aStats.isComplete) audioComplete.store(true, std::memory_order_relaxed);
-                if (aStats.isFailed) audioFailed.store(true, std::memory_order_relaxed);
+            pAudioDownloader->start(streams.audioUrl, audioTmp, 4, [pAudioComplete, pAudioFailed](const DownloadStats& aStats) {
+                if (aStats.isComplete) pAudioComplete->store(true, std::memory_order_relaxed);
+                if (aStats.isFailed) pAudioFailed->store(true, std::memory_order_relaxed);
             });
 
-            while (m_running && (!videoComplete.load() || !audioComplete.load()) && !videoFailed.load() && !audioFailed.load()) {
+            while (m_running && (!pVideoComplete->load() || !pAudioComplete->load()) && !pVideoFailed->load() && !pAudioFailed->load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
 
-            if (videoComplete.load() && audioComplete.load()) {
+            if (pVideoComplete->load() && pAudioComplete->load()) {
                 // Transition status to Merging
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
@@ -835,7 +1036,7 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                     }
                     if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
                 }
-            } else if (videoFailed.load() || audioFailed.load()) {
+            } else if (pVideoFailed->load() || pAudioFailed->load()) {
                 CleanupDownloadDiskFiles(item, true);
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
@@ -860,6 +1061,12 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                 }
                 if (m_onStatus) m_onStatus(id, DownloadStatus::Paused);
             }
+            if (m_queueActive.load() && id == m_activeQueueItemId) {
+                std::thread([this]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    ProcessNextQueueItem();
+                }).detach();
+            }
             return;
         } else {
             // Single Stream (e.g. 720p / 360p or Audio only)
@@ -871,7 +1078,7 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
     auto pDownloader = std::make_shared<SegmentedDownloader>();
     {
         std::lock_guard<std::mutex> lock(m_downloaderMutex);
-        m_activeDownloaders[id] = pDownloader;
+        m_activeDownloaders[id] = { pDownloader };
     }
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -898,7 +1105,12 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
         dbg.close();
       }
     }
-    pDownloader->start(item.url, item.savePath, conns, [this, id](const DownloadStats& stats) {
+    bool isAudioStream = (item.quality.find(L"Audio") != std::wstring::npos ||
+                          item.quality.find(L"MP3") != std::wstring::npos ||
+                          item.category == L"Music");
+    std::wstring destFilePath = isAudioStream ? (item.savePath + L".raw_audio_" + item.id + L".tmp") : item.savePath;
+
+    pDownloader->start(item.url, destFilePath, conns, [this, id, isAudioStream, destFilePath, item](const DownloadStats& stats) {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             for (auto& d : m_downloads) {
@@ -909,7 +1121,7 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
                     d.diagnosticText = stats.diagnosticText;
 
                     if (stats.isComplete && stats.downloadedBytes > 0) {
-                        d.status = DownloadStatus::Complete;
+                        d.status = isAudioStream ? DownloadStatus::Merging : DownloadStatus::Complete;
                         d.speedBytesPerSec = 0;
                     } else if (stats.isComplete && stats.downloadedBytes == 0) {
                         d.status = DownloadStatus::Error;
@@ -929,8 +1141,50 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
         }
 
         if (stats.isComplete && stats.downloadedBytes > 0) {
-            SaveHistory();
-            if (m_onStatus) m_onStatus(id, DownloadStatus::Complete);
+            if (isAudioStream) {
+                // Transcode raw stream into authentic 320kbps MP3
+                if (m_onStatus) m_onStatus(id, DownloadStatus::Merging);
+
+                bool cvtSuccess = ConvertToMp3(destFilePath, item.savePath);
+                DeleteFileW(destFilePath.c_str());
+
+                if (cvtSuccess) {
+                    WIN32_FILE_ATTRIBUTE_DATA fad;
+                    uint64_t finalSize = 0;
+                    if (GetFileAttributesExW(item.savePath.c_str(), GetFileExInfoStandard, &fad)) {
+                        finalSize = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        for (auto& d : m_downloads) {
+                            if (d.id == id) {
+                                d.status = DownloadStatus::Complete;
+                                d.downloadedBytes = (finalSize > 0) ? finalSize : d.sizeBytes;
+                                d.sizeBytes = (finalSize > 0) ? finalSize : d.sizeBytes;
+                                d.speedBytesPerSec = 0;
+                                break;
+                            }
+                        }
+                    }
+                    SaveHistory();
+                    if (m_onStatus) m_onStatus(id, DownloadStatus::Complete);
+                } else {
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        for (auto& d : m_downloads) {
+                            if (d.id == id) {
+                                d.status = DownloadStatus::Error;
+                                d.diagnosticText = L"MP3 transcoding failed.";
+                                break;
+                            }
+                        }
+                    }
+                    if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
+                }
+            } else {
+                SaveHistory();
+                if (m_onStatus) m_onStatus(id, DownloadStatus::Complete);
+            }
         } else if (stats.isComplete && stats.downloadedBytes == 0) {
             SaveHistory();
             if (m_onStatus) m_onStatus(id, DownloadStatus::Error);
@@ -942,6 +1196,13 @@ void DownloadEngine::DownloadWorker(std::wstring id) {
 
     while (pDownloader->isRunning()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    if (m_queueActive.load() && id == m_activeQueueItemId) {
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            ProcessNextQueueItem();
+        }).detach();
     }
 }
 

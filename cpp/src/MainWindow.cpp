@@ -30,6 +30,8 @@ void ShowMediaSnifferDialog(HWND hParent, DownloadItem &outStreamItem,
                             bool &outAdd);
 bool ShowDownloadFileInfoDialog(HWND hParent, DownloadItem &item,
                                 bool &outStartImmediately);
+bool ShowDownloadCompleteDialog(HWND hParent, const DownloadItem &item);
+void CacheStreamingMediaSizes(const std::wstring& url, const std::wstring& title, uint64_t videoSize, uint64_t audioSize);
 
 struct BridgeDownloadRequest {
   std::wstring url;
@@ -39,6 +41,9 @@ struct BridgeDownloadRequest {
   std::wstring userAgent;
   std::wstring quality;
   std::wstring originalPageUrl;
+  uint64_t totalSize = 0;
+  uint64_t videoSize = 0;
+  uint64_t audioSize = 0;
 };
 
 class MainWindow {
@@ -72,18 +77,17 @@ public:
                  ICC_TAB_CLASSES;
     InitCommonControlsEx(&icex);
 
-    HICON hIconBig = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 32,
-                                       32, LR_LOADFROMFILE);
+    HICON hIconBig = (HICON)LoadImageW(GetModuleHandle(NULL), MAKEINTRESOURCEW(101), IMAGE_ICON, 32, 32, 0);
     if (!hIconBig)
-      hIconBig =
-          (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico",
-                            IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
-    HICON hIconSmall = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 16,
-                                         16, LR_LOADFROMFILE);
+      hIconBig = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+    if (!hIconBig)
+      hIconBig = (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico", IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+
+    HICON hIconSmall = (HICON)LoadImageW(GetModuleHandle(NULL), MAKEINTRESOURCEW(101), IMAGE_ICON, 16, 16, 0);
     if (!hIconSmall)
-      hIconSmall =
-          (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico",
-                            IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+      hIconSmall = (HICON)LoadImageW(NULL, L"app_icon.ico", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+    if (!hIconSmall)
+      hIconSmall = (HICON)LoadImageW(NULL, L"d:\\Download Manager AB\\app_icon.ico", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
 
     WNDCLASSEXW wcex = {sizeof(WNDCLASSEXW)};
     wcex.lpfnWndProc = MainWindow::WndProc;
@@ -96,7 +100,7 @@ public:
     RegisterClassExW(&wcex);
 
     HWND hWnd = CreateWindowExW(
-        0, L"IDM_Native_MainWindowClass", L"AB Download Manager",
+        0, L"IDM_Native_MainWindowClass", L"PDM Download Manager",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
         1024, 620, NULL, NULL, GetModuleHandle(NULL), this);
 
@@ -142,7 +146,7 @@ inline std::wstring DetectCategoryFromFilename(const std::wstring& filename) {
     if (ext == L"exe" || ext == L"msi" || ext == L"apk" || ext == L"bat" || ext == L"cmd" || ext == L"jar" || ext == L"appx") {
         return L"Programs";
     }
-    if (ext == L"pdf" || ext == L"doc" || ext == L"docx" || ext == L"xls" || ext == L"xlsx" || ext == L"ppt" || ext == L"pptx" || ext == L"txt" || ext == L"tex" || ext == L"rtf" || ext == L"epub") {
+    if (ext == L"pdf" || ext == L"doc" || ext == L"docx" || ext == L"xls" || ext == L"xlsx" || ext == L"ppt" || ext == L"pptx" || ext == L"txt" || ext == L"tex" || ext == L"rtf" || ext == L"epub" || ext == L"md" || ext == L"markdown" || ext == L"json" || ext == L"csv") {
         return L"Documents";
     }
     return L"General";
@@ -165,7 +169,7 @@ inline std::wstring GetDefaultDownloadsFolder() {
 
   struct StreamDownloadSession {
     DownloadItem item;
-    std::ofstream fileStream;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
     std::wstring savePath;
     uint64_t totalBytes = 0;
     uint64_t downloadedBytes = 0;
@@ -196,20 +200,36 @@ inline std::wstring GetDefaultDownloadsFolder() {
     item.status = DownloadStatus::Downloading;
     item.connections = 1;
 
+    // Show the Download File Info dialog so user can choose destination folder / rename file
+    bool startImmediately = true;
+    if (!ShowDownloadFileInfoDialog(m_hWnd, item, startImmediately)) {
+      return false; // User cancelled
+    }
+
     EnsureDirectoryExists(item.savePath);
+
+    HANDLE hFile = CreateFileW(
+        item.savePath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+      return false;
+    }
 
     auto session = std::make_shared<StreamDownloadSession>();
     session->item = item;
     session->savePath = item.savePath;
     session->totalBytes = totalSize;
     session->downloadedBytes = 0;
+    session->hFile = hFile;
     session->lastSpeedTime = std::chrono::steady_clock::now();
     session->lastSpeedBytes = 0;
-    session->fileStream.open(item.savePath, std::ios::binary | std::ios::trunc);
-
-    if (!session->fileStream.is_open()) {
-      return false;
-    }
 
     {
       std::lock_guard<std::mutex> lock(m_streamSessionMutex);
@@ -233,8 +253,9 @@ inline std::wstring GetDefaultDownloadsFolder() {
       }
     }
 
-    if (session && session->fileStream.is_open() && data && size > 0) {
-      session->fileStream.write(data, size);
+    if (session && session->hFile != INVALID_HANDLE_VALUE && data && size > 0) {
+      DWORD written = 0;
+      WriteFile(session->hFile, data, (DWORD)size, &written, NULL);
       session->downloadedBytes += size;
       session->item.downloadedBytes = session->downloadedBytes;
 
@@ -262,20 +283,24 @@ inline std::wstring GetDefaultDownloadsFolder() {
     }
 
     if (session) {
-      if (session->fileStream.is_open()) {
-        session->fileStream.flush();
-        session->fileStream.close();
+      if (session->hFile != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(session->hFile);
+        CloseHandle(session->hFile);
+        session->hFile = INVALID_HANDLE_VALUE;
       }
 
-      if (success) {
+      if (success && session->downloadedBytes > 0) {
         session->item.status = DownloadStatus::Complete;
         if (session->totalBytes > 0) session->item.downloadedBytes = session->totalBytes;
         else session->item.sizeBytes = session->downloadedBytes;
         session->item.speedBytesPerSec = 0;
         m_engine.UpdateItem(session->item);
+
+        // Show Download Complete Dialog
+        PostMessageW(m_hWnd, WM_USER + 203, (WPARAM) new DownloadItem(session->item), 0);
       } else {
         session->item.status = DownloadStatus::Error;
-        session->item.diagnosticText = errorMsg.empty() ? L"Stream failed" : errorMsg;
+        session->item.diagnosticText = errorMsg.empty() ? L"Stream failed or returned 0 bytes" : errorMsg;
         m_engine.UpdateItem(session->item);
       }
 
@@ -289,37 +314,83 @@ inline std::wstring GetDefaultDownloadsFolder() {
                          const std::wstring &cookies = L"",
                          const std::wstring &userAgent = L"",
                          const std::wstring &quality = L"",
-                         const std::wstring &originalPageUrl = L"") {
+                         const std::wstring &originalPageUrl = L"",
+                         uint64_t totalSize = 0,
+                         uint64_t videoSize = 0,
+                         uint64_t audioSize = 0) {
+    if (videoSize > 0 || audioSize > 0) {
+      CacheStreamingMediaSizes(url, filename, videoSize, audioSize);
+      if (!originalPageUrl.empty() && originalPageUrl != url) {
+        CacheStreamingMediaSizes(originalPageUrl, filename, videoSize, audioSize);
+      }
+    }
+
     DownloadItem item;
     item.id = L"dl-" + std::to_wstring(GetTickCount());
     item.url = url;
     item.quality = quality;
     item.originalPageUrl = originalPageUrl;
 
+    bool isAudio = (quality.find(L"Audio") != std::wstring::npos ||
+                    quality.find(L"MP3") != std::wstring::npos ||
+                    quality.find(L"M4A") != std::wstring::npos);
+    std::wstring mediaExt = (quality.find(L"M4A") != std::wstring::npos) ? L".m4a" : L".mp3";
+
     // Parse filename
-    if (!filename.empty() && filename != L"watch" && filename != L"YouTube_Video.mp4" && filename != L"Facebook_Video.mp4") {
+    if (!filename.empty() && filename != L"watch" && filename != L"download-file" && filename != L"YouTube_Video.mp4" && filename != L"Facebook_Video.mp4") {
       item.filename = filename;
+      if (isAudio && item.filename.length() > 4 && item.filename.substr(item.filename.length() - 4) == L".mp4") {
+        item.filename = item.filename.substr(0, item.filename.length() - 4) + mediaExt;
+      }
     } else if (DownloadEngine::IsStreamingMediaURL(url)) {
       std::wstring exactTitle = DownloadEngine::GetMediaTitle(url);
       if (!exactTitle.empty()) {
-        item.filename = exactTitle + L".mp4";
+        item.filename = exactTitle + (isAudio ? mediaExt : L".mp4");
       } else {
         if (url.find(L"youtube.com") != std::wstring::npos || url.find(L"youtu.be") != std::wstring::npos) {
-          item.filename = L"YouTube_Video.mp4";
+          item.filename = isAudio ? L"YouTube_Audio.mp3" : L"YouTube_Video.mp4";
         } else if (url.find(L"facebook.com") != std::wstring::npos || url.find(L"fb.watch") != std::wstring::npos) {
-          item.filename = L"Facebook_Video.mp4";
+          item.filename = isAudio ? L"Facebook_Audio.mp3" : L"Facebook_Video.mp4";
         } else {
-          item.filename = L"Stream_Video.mp4";
+          item.filename = isAudio ? L"Stream_Audio.mp3" : L"Stream_Video.mp4";
         }
       }
     } else {
-      size_t slash = url.find_last_of(L'/');
-      item.filename = (slash != std::wstring::npos && slash + 1 < url.length())
-                          ? url.substr(slash + 1)
-                          : L"download.bin";
-      size_t qmark = item.filename.find(L'?');
-      if (qmark != std::wstring::npos)
-        item.filename = item.filename.substr(0, qmark);
+      // Check query parameters first (e.g. ?path=%2Fmnt%2Fuser-data%2Foutputs%2Fdesign.md, ?filename=, ?file=)
+      size_t pathPos = url.find(L"path=");
+      if (pathPos == std::wstring::npos) pathPos = url.find(L"filename=");
+      if (pathPos == std::wstring::npos) pathPos = url.find(L"file=");
+      if (pathPos != std::wstring::npos) {
+        size_t valStart = url.find(L'=', pathPos) + 1;
+        size_t valEnd = url.find(L'&', valStart);
+        std::wstring rawVal = (valEnd != std::wstring::npos) ? url.substr(valStart, valEnd - valStart) : url.substr(valStart);
+        std::wstring decoded;
+        for (size_t i = 0; i < rawVal.length(); ++i) {
+          if (rawVal[i] == L'%' && i + 2 < rawVal.length()) {
+            std::wstring hex = rawVal.substr(i + 1, 2);
+            wchar_t ch = (wchar_t)wcstol(hex.c_str(), NULL, 16);
+            decoded += ch;
+            i += 2;
+          } else {
+            decoded += rawVal[i];
+          }
+        }
+        size_t lastSlash = decoded.find_last_of(L"/\\");
+        std::wstring base = (lastSlash != std::wstring::npos) ? decoded.substr(lastSlash + 1) : decoded;
+        if (!base.empty() && base.find(L'.') != std::wstring::npos) {
+          item.filename = base;
+        }
+      }
+
+      if (item.filename.empty() || item.filename == L"download-file") {
+        size_t slash = url.find_last_of(L'/');
+        item.filename = (slash != std::wstring::npos && slash + 1 < url.length())
+                            ? url.substr(slash + 1)
+                            : L"download.bin";
+        size_t qmark = item.filename.find(L'?');
+        if (qmark != std::wstring::npos)
+          item.filename = item.filename.substr(0, qmark);
+      }
     }
 
     // Handle bare extension names (like "/download/zip")
@@ -328,20 +399,19 @@ inline std::wstring GetDefaultDownloadsFolder() {
     else if (item.filename == L"7z") item.filename = L"archive.7z";
     else if (item.filename == L"tar") item.filename = L"archive.tar";
     else if (item.filename == L"gz") item.filename = L"archive.gz";
-    else if (item.filename == L"mp4") item.filename = L"video.mp4";
+    else if (item.filename == L"mp4") item.filename = isAudio ? L"audio.mp3" : L"video.mp4";
     else if (item.filename == L"mp3") item.filename = L"audio.mp3";
     else if (item.filename == L"pdf") item.filename = L"document.pdf";
     else if (item.filename == L"exe") item.filename = L"setup.exe";
 
-    item.category = DetectCategoryFromFilename(item.filename);
+    item.category = isAudio ? L"Music" : DetectCategoryFromFilename(item.filename);
     std::wstring baseDownloads = GetDefaultDownloadsFolder();
     item.savePath = baseDownloads + item.category + L"\\" + item.filename;
     item.referer = referer;
     item.cookies = cookies;
     item.userAgent = userAgent;
     item.description = L"Captured via IDM Browser Sniffer";
-    item.sizeBytes =
-        0; // Starts at 0, dynamically resolved from manifest/headers
+    item.sizeBytes = totalSize;
     item.downloadedBytes = 0;
     item.status = DownloadStatus::Downloading;
     item.connections = 16;
@@ -381,7 +451,7 @@ inline std::wstring GetDefaultDownloadsFolder() {
                        std::to_wstring(st.wYear);
 
     bool startImmediately = true;
-    if (ShowDownloadFileInfoDialog(m_hWnd, item, startImmediately)) {
+    if (ShowDownloadFileInfoDialog(NULL, item, startImmediately)) {
       item.status = startImmediately ? DownloadStatus::Downloading
                                      : DownloadStatus::Queued;
       m_engine.AddItem(item);
@@ -391,7 +461,7 @@ inline std::wstring GetDefaultDownloadsFolder() {
       PopulateListView();
 
       if (startImmediately) {
-        ShowDownloadProgressDialog(m_hWnd, &item, &m_engine);
+        ShowDownloadProgressDialog(NULL, &item, &m_engine);
       }
     }
   }
@@ -428,9 +498,10 @@ private:
         [this](const std::wstring &url, const std::wstring &filename,
                const std::wstring &referer, const std::wstring &cookies,
                const std::wstring &userAgent, const std::wstring &quality,
-               const std::wstring &originalPageUrl) {
+               const std::wstring &originalPageUrl, uint64_t totalSize,
+               uint64_t videoSize, uint64_t audioSize) {
           // Post notification to main thread
-          auto *req = new BridgeDownloadRequest{url, filename, referer, cookies, userAgent, quality, originalPageUrl};
+          auto *req = new BridgeDownloadRequest{url, filename, referer, cookies, userAgent, quality, originalPageUrl, totalSize, videoSize, audioSize};
           PostMessageW(m_hWnd, WM_USER + 200, (WPARAM)req, 0);
         },
         [](const std::wstring &url) {
@@ -451,13 +522,13 @@ private:
 
     // Setup Engine Callbacks
     m_engine.SetCallbacks(
-        [this](const std::wstring &id, uint64_t downloaded, uint64_t total,
-               uint64_t speed) { PostMessageW(m_hWnd, WM_USER + 101, 0, 0); },
+        [](const std::wstring &id, uint64_t downloaded, uint64_t total,
+           uint64_t speed) { /* Handled smoothly by 250ms UI timer */ },
         [this](const std::wstring &id, DownloadStatus status) {
           PostMessageW(m_hWnd, WM_USER + 102, 0, 0);
         });
 
-    SetTimer(m_hWnd, 1, 50, NULL);
+    SetTimer(m_hWnd, 1, 250, NULL);
   }
 
   void CreateMenuBar() {
@@ -465,7 +536,6 @@ private:
 
     HMENU hMenuTasks = CreatePopupMenu();
     AppendMenuW(hMenuTasks, MF_STRING, 1001, L"&Add new download...\tCtrl+N");
-    AppendMenuW(hMenuTasks, MF_STRING, 1002, L"&Media Sniffer Studio...");
     AppendMenuW(hMenuTasks, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenuTasks, MF_STRING, 1003, L"Stop all downloads");
     AppendMenuW(hMenuTasks, MF_STRING, 1004, L"Resume all downloads");
@@ -479,7 +549,6 @@ private:
 
     HMENU hMenuDownloads = CreatePopupMenu();
     AppendMenuW(hMenuDownloads, MF_STRING, 1010, L"&Options...\tAlt+O");
-    AppendMenuW(hMenuDownloads, MF_STRING, 1011, L"&Scheduler...");
     AppendMenuW(hMenuDownloads, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenuDownloads, MF_STRING, 1012, L"Delete &Completed");
     AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hMenuDownloads, L"&Downloads");
@@ -490,7 +559,7 @@ private:
     AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hMenuView, L"&View");
 
     HMENU hMenuHelp = CreatePopupMenu();
-    AppendMenuW(hMenuHelp, MF_STRING, 1030, L"About AB Download Manager...");
+    AppendMenuW(hMenuHelp, MF_STRING, 1030, L"About PDM Download Manager...");
     AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hMenuHelp, L"&Help");
 
     HMENU hMenuReg = CreatePopupMenu();
@@ -698,13 +767,6 @@ private:
                              {0},
                              0,
                              (INT_PTR)L"Options"},
-                            {7,
-                             1011,
-                             TBSTATE_ENABLED,
-                             BTNS_BUTTON | BTNS_SHOWTEXT,
-                             {0},
-                             0,
-                             (INT_PTR)L"Scheduler"},
                             {8,
                              1004,
                              TBSTATE_ENABLED,
@@ -718,15 +780,7 @@ private:
                              BTNS_BUTTON | BTNS_SHOWTEXT,
                              {0},
                              0,
-                             (INT_PTR)L"Stop Qu..."},
-                            {0, 0, 0, BTNS_SEP, {0}, 0, 0},
-                            {10,
-                             1002,
-                             TBSTATE_ENABLED,
-                             BTNS_BUTTON | BTNS_SHOWTEXT,
-                             {0},
-                             0,
-                             (INT_PTR)L"Media Sniffer"}};
+                             (INT_PTR)L"Stop Qu..."}};
 
     SendMessageW(m_hToolbar, TB_ADDBUTTONS,
                  sizeof(tbButtons) / sizeof(TBBUTTON), (LPARAM)&tbButtons);
@@ -801,44 +855,6 @@ private:
     // Subclass ListView to support mouse drag selection, Delete key, and Ctrl+A select all
     SetWindowSubclass(m_hListView, ListViewSubclassProc, 2, (DWORD_PTR)this);
 
-    // Build 16x16 ListView icons.
-    m_hImageListLv = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 8, 8);
-
-    auto AddLvIcon = [&](COLORREF c, int t) {
-      HICON hIco = IconFactory::CreateColoredIcon(16, c, t);
-      if (hIco) {
-        ImageList_AddIcon(m_hImageListLv, hIco);
-        DestroyIcon(hIco);
-      }
-    };
-
-    auto AddCategoryLvIcon = [&](const std::wstring& cat) {
-      HICON hIco = IconFactory::CreateCategoryIcon(16, cat);
-      if (hIco) {
-        ImageList_AddIcon(m_hImageListLv, hIco);
-        DestroyIcon(hIco);
-      }
-    };
-
-    // Index 0: Programs (Blue EXE)
-    AddCategoryLvIcon(L"Programs");
-    // Index 1: Compressed (WinRAR style)
-    AddCategoryLvIcon(L"Compressed");
-    // Index 2: Video (MP4 / Film)
-    AddCategoryLvIcon(L"Video");
-    // Index 3: Music (Purple Note)
-    AddCategoryLvIcon(L"Music");
-    // Index 4: PDF (Adobe Red PDF)
-    AddCategoryLvIcon(L"PDF");
-    // Index 5: DOCX / Word (Microsoft Word Blue)
-    AddCategoryLvIcon(L"DOCX");
-    // Index 6: Documents (Generic Document)
-    AddCategoryLvIcon(L"Documents");
-    // Index 7: General (Globe)
-    AddCategoryLvIcon(L"General");
-
-    ListView_SetImageList(m_hListView, m_hImageListLv, LVSIL_SMALL);
-
     LVCOLUMNW lvc = {0};
     lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
@@ -891,7 +907,7 @@ private:
     int parts[] = {380, 750, -1};
     SendMessageW(m_hStatusBar, SB_SETPARTS, 3, (LPARAM)parts);
     SendMessageW(m_hStatusBar, SB_SETTEXTW, 0,
-                 (LPARAM)L"AB Engine: Ready (16-thread Acceleration)");
+                 (LPARAM)L"PDM Engine: Ready (16-thread Acceleration)");
     SendMessageW(
         m_hStatusBar, SB_SETTEXTW, 1,
         (LPARAM)L"Browser Integration: Active (Chrome, Edge, Firefox)");
@@ -933,32 +949,10 @@ private:
       for (size_t i = 0; i < items.size(); ++i) {
         const auto &item = items[i];
         LVITEMW lvi = {0};
-        lvi.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
+        lvi.mask = LVIF_TEXT | LVIF_PARAM;
         lvi.iItem = (int)i;
         lvi.iSubItem = 0;
-        int iconIdx = 7; // Default General
-        std::wstring fn = item.filename;
-        size_t dotPos = fn.find_last_of(L'.');
-        std::wstring ext = (dotPos != std::wstring::npos) ? fn.substr(dotPos + 1) : L"";
-        for (auto& c : ext) c = towlower(c);
-
-        if (ext == L"pdf") {
-          iconIdx = 4; // PDF
-        } else if (ext == L"docx" || ext == L"doc") {
-          iconIdx = 5; // DOCX / Word
-        } else if (item.category == L"Programs" || ext == L"exe" || ext == L"msi" || ext == L"apk") {
-          iconIdx = 0; // Programs
-        } else if (item.category == L"Compressed" || ext == L"zip" || ext == L"rar" || ext == L"7z" || ext == L"tar" || ext == L"gz") {
-          iconIdx = 1; // Compressed
-        } else if (item.category == L"Video" || ext == L"mp4" || ext == L"mkv" || ext == L"avi" || ext == L"webm") {
-          iconIdx = 2; // Video
-        } else if (item.category == L"Music" || ext == L"mp3" || ext == L"wav" || ext == L"flac" || ext == L"aac" || ext == L"m4a") {
-          iconIdx = 3; // Music
-        } else if (item.category == L"Documents" || ext == L"txt" || ext == L"tex" || ext == L"rtf") {
-          iconIdx = 6; // Documents
-        }
-
-        lvi.iImage = iconIdx;
+        lvi.pszText = const_cast<LPWSTR>(item.filename.c_str());
         lvi.lParam = (LPARAM)i;
         ListView_InsertItem(m_hListView, &lvi);
       }
@@ -973,8 +967,20 @@ private:
       }
     }
 
+    auto SetItemTextIfChanged = [this](int itemIdx, int subItemIdx, const std::wstring& newText) {
+      wchar_t curText[512] = {0};
+      ListView_GetItemText(m_hListView, itemIdx, subItemIdx, curText, 512);
+      if (newText != curText) {
+        ListView_SetItemText(m_hListView, itemIdx, subItemIdx, const_cast<LPWSTR>(newText.c_str()));
+      }
+    };
+
     for (size_t i = 0; i < items.size(); ++i) {
       const auto &item = items[i];
+
+      // Update File Name and Queue
+      SetItemTextIfChanged((int)i, 0, item.filename);
+      SetItemTextIfChanged((int)i, 1, item.queueName.empty() ? L"" : item.queueName);
 
       // Size format (GB / MB / KB / Bytes)
       std::wstring strSize;
@@ -1001,25 +1007,17 @@ private:
                       ? L"Connecting..."
                       : L"--";
       }
-      ListView_SetItemText(m_hListView, (int)i, 2,
-                           const_cast<LPWSTR>(strSize.c_str()));
+      SetItemTextIfChanged((int)i, 2, strSize);
 
       // Status, Time Left, and Transfer Rate format
       if (item.status == DownloadStatus::Complete) {
-        std::wstring st = L"Complete";
-        ListView_SetItemText(m_hListView, (int)i, 3,
-                             const_cast<LPWSTR>(st.c_str()));
-        ListView_SetItemText(m_hListView, (int)i, 4, const_cast<LPWSTR>(L""));
-        ListView_SetItemText(m_hListView, (int)i, 5, const_cast<LPWSTR>(L""));
+        SetItemTextIfChanged((int)i, 3, L"Complete");
+        SetItemTextIfChanged((int)i, 4, L"");
+        SetItemTextIfChanged((int)i, 5, L"");
       } else if (item.status == DownloadStatus::Merging) {
-        std::wstring st = L"Merging (100%)";
-        ListView_SetItemText(m_hListView, (int)i, 3,
-                             const_cast<LPWSTR>(st.c_str()));
-        std::wstring strTime = L"Merging...";
-        ListView_SetItemText(m_hListView, (int)i, 4,
-                             const_cast<LPWSTR>(strTime.c_str()));
-        ListView_SetItemText(m_hListView, (int)i, 5,
-                             const_cast<LPWSTR>(L"Lossless Mux"));
+        SetItemTextIfChanged((int)i, 3, L"Merging (100%)");
+        SetItemTextIfChanged((int)i, 4, L"Merging...");
+        SetItemTextIfChanged((int)i, 5, L"Lossless Mux");
       } else if (item.status == DownloadStatus::Downloading) {
         std::wstring st;
         if (item.sizeBytes > 0) {
@@ -1030,8 +1028,7 @@ private:
         } else {
           st = L"Connecting (0%)";
         }
-        ListView_SetItemText(m_hListView, (int)i, 3,
-                             const_cast<LPWSTR>(st.c_str()));
+        SetItemTextIfChanged((int)i, 3, st);
 
         // Calculate accurate Time Left
         std::wstring strTime = L"--";
@@ -1056,8 +1053,7 @@ private:
                    item.downloadedBytes < item.sizeBytes) {
           strTime = L"Stalled";
         }
-        ListView_SetItemText(m_hListView, (int)i, 4,
-                             const_cast<LPWSTR>(strTime.c_str()));
+        SetItemTextIfChanged((int)i, 4, strTime);
 
         // Calculate accurate Transfer Rate
         std::wstringstream ssSpeed;
@@ -1073,21 +1069,24 @@ private:
         } else {
           ssSpeed << L"0.00 KB/s";
         }
-        std::wstring strSpeed = ssSpeed.str();
-        ListView_SetItemText(m_hListView, (int)i, 5,
-                             const_cast<LPWSTR>(strSpeed.c_str()));
+        SetItemTextIfChanged((int)i, 5, ssSpeed.str());
+      } else if (item.status == DownloadStatus::Queued) {
+        SetItemTextIfChanged((int)i, 3, L"Queued (Download Later)");
+        SetItemTextIfChanged((int)i, 4, L"In Queue");
+        SetItemTextIfChanged((int)i, 5, L"");
       } else if (item.status == DownloadStatus::Paused) {
-        std::wstring st = L"Paused";
-        ListView_SetItemText(m_hListView, (int)i, 3,
-                             const_cast<LPWSTR>(st.c_str()));
-        ListView_SetItemText(m_hListView, (int)i, 4, const_cast<LPWSTR>(L""));
-        ListView_SetItemText(m_hListView, (int)i, 5, const_cast<LPWSTR>(L""));
+        SetItemTextIfChanged((int)i, 3, L"Paused");
+        SetItemTextIfChanged((int)i, 4, L"");
+        SetItemTextIfChanged((int)i, 5, L"");
+      } else if (item.status == DownloadStatus::Error) {
+        std::wstring st = item.diagnosticText.empty() ? L"Error" : (L"Error: " + item.diagnosticText);
+        SetItemTextIfChanged((int)i, 3, st);
+        SetItemTextIfChanged((int)i, 4, L"");
+        SetItemTextIfChanged((int)i, 5, L"");
       }
 
-      ListView_SetItemText(m_hListView, (int)i, 6,
-                           const_cast<LPWSTR>(item.lastTryDate.c_str()));
-      ListView_SetItemText(m_hListView, (int)i, 7,
-                           const_cast<LPWSTR>(item.description.c_str()));
+      SetItemTextIfChanged((int)i, 6, item.lastTryDate);
+      SetItemTextIfChanged((int)i, 7, item.description);
     }
   }
 
@@ -1138,9 +1137,24 @@ private:
     }
 
     case WM_TIMER:
-    case WM_USER + 101:
+    case WM_USER + 101: {
+      PopulateListView();
+      return 0;
+    }
+
     case WM_USER + 102: {
       PopulateListView();
+      if (m_engine.IsQueueActive()) {
+        std::wstring activeId = m_engine.GetActiveQueueItemId();
+        static std::wstring s_lastShownQueueId;
+        if (!activeId.empty() && activeId != s_lastShownQueueId) {
+          s_lastShownQueueId = activeId;
+          DownloadItem activeItem = m_engine.GetItem(activeId);
+          if (activeItem.status == DownloadStatus::Downloading) {
+            ShowDownloadProgressDialog(m_hWnd, &activeItem, &m_engine);
+          }
+        }
+      }
       return 0;
     }
 
@@ -1220,9 +1234,7 @@ private:
     case WM_USER + 200: { // Incoming request from browser extension HTTP bridge
       auto *req = (BridgeDownloadRequest *)wParam;
       if (req) {
-        if (IsIconic(m_hWnd)) ShowWindow(m_hWnd, SW_RESTORE);
-        SetForegroundWindow(m_hWnd);
-        TriggerAddFromUrl(req->url, req->filename, req->referer, req->cookies, req->userAgent, req->quality, req->originalPageUrl);
+        TriggerAddFromUrl(req->url, req->filename, req->referer, req->cookies, req->userAgent, req->quality, req->originalPageUrl, req->totalSize, req->videoSize, req->audioSize);
         delete req;
       }
       return 0;
@@ -1232,8 +1244,7 @@ private:
         201: { // CLI-launched URL (deferred so message loop is running)
       auto *req = (BridgeDownloadRequest *)wParam;
       if (req) {
-        SetForegroundWindow(m_hWnd);
-        TriggerAddFromUrl(req->url, req->filename, req->referer, req->cookies, req->userAgent, req->quality, req->originalPageUrl);
+        TriggerAddFromUrl(req->url, req->filename, req->referer, req->cookies, req->userAgent, req->quality, req->originalPageUrl, req->totalSize, req->videoSize, req->audioSize);
         delete req;
       }
       return 0;
@@ -1243,7 +1254,17 @@ private:
       auto *item = (DownloadItem *)wParam;
       if (item) {
         PopulateListView();
-        ShowDownloadProgressDialog(m_hWnd, item, &m_engine);
+        ShowDownloadProgressDialog(NULL, item, &m_engine);
+        delete item;
+      }
+      return 0;
+    }
+
+    case WM_USER + 203: { // Stream relay completed: show download complete dialog
+      auto *item = (DownloadItem *)wParam;
+      if (item) {
+        PopulateListView();
+        ShowDownloadCompleteDialog(NULL, *item);
         delete item;
       }
       return 0;
@@ -1428,11 +1449,25 @@ private:
           }
         }
         PopulateListView();
-      } else if (id == 1003) { // Stop All
+      } else if (id == 1003) { // Stop All / Stop Queue
+        m_engine.StopQueue();
         m_engine.StopAll();
         PopulateListView();
-      } else if (id == 1004) { // Resume All / Start Queue
-        m_engine.ResumeAll();
+      } else if (id == 1004) { // Start Queue (Sequential One-by-One Queue)
+        if (!m_engine.StartQueue()) {
+          MessageBoxW(m_hWnd,
+              L"The download queue is empty.\n\nTo add files to the download queue, click 'Download Later' in the Download File Info dialog.",
+              L"Download Queue", MB_ICONINFORMATION | MB_OK);
+        } else {
+          PopulateListView();
+          std::wstring activeId = m_engine.GetActiveQueueItemId();
+          if (!activeId.empty()) {
+            DownloadItem activeItem = m_engine.GetItem(activeId);
+            if (!activeItem.id.empty()) {
+              ShowDownloadProgressDialog(m_hWnd, &activeItem, &m_engine);
+            }
+          }
+        }
         PopulateListView();
       } else if (id == 2003) { // Delete Selected
         auto indices = GetSelectedListViewIndices();
@@ -1525,9 +1560,9 @@ private:
         PostQuitMessage(0);
       } else if (id == 1030) { // About
         MessageBoxW(m_hWnd,
-                    L"AB Download Manager\nEngine: 16-thread Range "
+                    L"PDM Download Manager\nEngine: 16-thread Range "
                     L"Acceleration & Media Sniffer\nAll rights reserved.",
-                    L"About AB Download Manager", MB_OK | MB_ICONINFORMATION);
+                    L"About PDM Download Manager", MB_OK | MB_ICONINFORMATION);
       }
       return 0;
     }
