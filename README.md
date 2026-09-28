@@ -130,7 +130,9 @@ When a new URL is registered, the engine initiates a probing handshake:
    - Given a file size $S$ and connections $N$, chunk $k$ bounds are defined as:
 
      $$
+     
      \text{Start}_k = k \cdot \left\lfloor\frac{S}{N}\right\rfloor, \quad \text{End}_k = \begin{cases} (k+1) \cdot \left\lfloor\frac{S}{N}\right\rfloor - 1 & \text{if } k < N-1 \\ S - 1 & \text{if } k = N-1 \end{cases}
+     
      $$
 
 3. **Fallback Single Stream**:
