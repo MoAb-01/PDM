@@ -129,11 +129,9 @@ When a new URL is registered, the engine initiates a probing handshake:
    - If range requests are supported, the engine splits the file into $N$ equal chunks (configurable from 1 up to 16 concurrent connections).
    - Given a file size $S$ and connections $N$, chunk $k$ bounds are defined as:
 
-     $$
-     
-     \text{Start}_k = k \cdot \left\lfloor\frac{S}{N}\right\rfloor, \quad \text{End}_k = \begin{cases} (k+1) \cdot \left\lfloor\frac{S}{N}\right\rfloor - 1 & \text{if } k < N-1 \\ S - 1 & \text{if } k = N-1 \end{cases}
-     
-     $$
+$$
+\text{Start}_k = k \cdot \left\lfloor\frac{S}{N}\right\rfloor, \quad \text{End}_k = \begin{cases} (k+1) \cdot \left\lfloor\frac{S}{N}\right\rfloor - 1 & \text{if } k < N-1 \\ S - 1 & \text{if } k = N-1 \end{cases}
+$$
 
 3. **Fallback Single Stream**:
    - If the server answers with `200 OK` (ignoring the Range request) or does not provide `Content-Length`, the engine safely falls back to a single streaming thread, capturing data until EOF without corrupting chunk boundaries.
