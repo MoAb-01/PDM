@@ -1,7 +1,7 @@
 <div align="center">
   <img src="docs/assets/app_icon.png" alt="PDM Icon" width="128" height="128" />
   <h1>PDM</h1>
-  <p><strong>Next-Gen High-Performance C++20 Multithreaded Download Accelerator & Media Sniffer</strong></p>
+  <p><strong>Optimized C++20 parallel multithreaded downloader</strong></p>
 
   [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg?style=flat&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
   [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D6?style=flat&logo=windows)](https://microsoft.com/windows)
@@ -128,7 +128,11 @@ When a new URL is registered, the engine initiates a probing handshake:
 2. **Segment Distribution**:
    - If range requests are supported, the engine splits the file into $N$ equal chunks (configurable from 1 up to 16 concurrent connections).
    - Given a file size $S$ and connections $N$, chunk $k$ bounds are defined as:
-     $$\text{Start}_k = k \cdot \left\lfloor\frac{S}{N}\right\rfloor, \quad \text{End}_k = \begin{cases} (k+1) \cdot \left\lfloor\frac{S}{N}\right\rfloor - 1 & \text{if } k < N-1 \\ S - 1 & \text{if } k = N-1 \end{cases}$$
+
+     $$
+     \text{Start}_k = k \cdot \left\lfloor\frac{S}{N}\right\rfloor, \quad \text{End}_k = \begin{cases} (k+1) \cdot \left\lfloor\frac{S}{N}\right\rfloor - 1 & \text{if } k < N-1 \\ S - 1 & \text{if } k = N-1 \end{cases}
+     $$
+
 3. **Fallback Single Stream**:
    - If the server answers with `200 OK` (ignoring the Range request) or does not provide `Content-Length`, the engine safely falls back to a single streaming thread, capturing data until EOF without corrupting chunk boundaries.
 
@@ -379,6 +383,9 @@ PDM provides fine-grained control over network operations through its Options di
 ## Contributing & License
 
 Contributions, bug reports, and pull requests are welcome!
+
+> [!NOTE]
+> This is the first beta version of the program. Instead of yelling at me, let's collaborate to create a peculiar alternative to paid downloaders!
 
 1. Fork the Project.
 2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`).
