@@ -1,8 +1,13 @@
+> [!Note]
+> **PDM is now discontinued.** Development has moved to its successor — follow **[Mister Download Manager](https://github.com/anefzaoui/misterdownloadmanager))** for the latest updates, features, and releases.
+
 <div align="center">
   <img src="docs/assets/app_icon.png" alt="PDM Icon" width="128" height="128" />
   <h1>PDM</h1>
   <p><strong>Optimized C++20 parallel multithreaded downloader</strong></p>
 
+  [![Status](https://img.shields.io/badge/Status-Discontinued-red.svg?style=flat)]()
+  [![Successor](https://img.shields.io/badge/Follow-Mister%20Download%20Manager-blueviolet.svg?style=flat)](https://github.com/MoAb-01/Mister-Download-Manager)
   [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg?style=flat&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
   [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D6?style=flat&logo=windows)](https://microsoft.com/windows)
   [![React](https://img.shields.io/badge/Web%20Dashboard-React%2019%20%2B%20Vite-61DAFB?style=flat&logo=react)](https://react.dev/)
